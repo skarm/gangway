@@ -1,0 +1,53 @@
+services:
+  gangway:
+    build:
+      context: .
+      args:
+        REVISION: ${GIT_REVISION:-}
+        VERSION: ${GANGWAY_VERSION:-}
+    image: gangway:local
+    user: "1000:1000"
+    group_add:
+      - "${DOCKER_GID:?Set DOCKER_GID to the host Docker socket group ID}"
+    command:
+      - --docker-socket=/run/docker-host/docker.sock
+    environment:
+      # Saturation shows up as GC pressure rather than an OOM kill.
+      GOMEMLIMIT: 448MiB
+    volumes:
+      - type: bind
+        source: ${DOCKER_SOCKET_DIR:-/var/run}
+        target: /run/docker-host
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: proxy-socket
+        target: /run/gangway
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    network_mode: none
+    restart: unless-stopped
+    stop_grace_period: 70s
+    pids_limit: 128
+    cpus: 2.0
+    # Worst case in flight is --max-concurrent (64) decodes of
+    # --max-response-bytes (4 MiB) each; lower this together with those flags.
+    mem_limit: 512m
+    mem_reservation: 32m
+    # Headroom over 4 x --max-concurrent connections plus one upstream socket
+    # per request, not a throttle.
+    ulimits:
+      nofile:
+        soft: 1024
+        hard: 1024
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  proxy-socket:

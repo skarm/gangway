@@ -1,0 +1,381 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A bumped go directive must not make CI fetch a different compiler than the
+  # one setup-go installed, and no step may rewrite go.mod to make itself pass.
+  GOTOOLCHAIN: local
+  GOFLAGS: -mod=readonly
+  # Pinned and checksum-verified through the module proxy, like a dependency.
+  GOVULNCHECK_VERSION: v1.8.0
+  STATICCHECK_VERSION: v0.8.1
+  ACTIONLINT_VERSION: v1.7.12
+  DOCKER_BUILDKIT: "1"
+
+jobs:
+  analyze:
+    name: Static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            printf 'not gofmt-clean:\n%s\n' "$files"
+            exit 1
+          fi
+
+      # Compared through copies rather than git, so an absent go.sum is handled
+      # the same as a stale one.
+      - name: Check module hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+          go mod verify
+          cp go.mod /tmp/go.mod.before
+          if [ -f go.sum ]; then cp go.sum /tmp/go.sum.before; else : > /tmp/go.sum.before; fi
+          go mod tidy
+          if [ -f go.sum ]; then cp go.sum /tmp/go.sum.after; else : > /tmp/go.sum.after; fi
+          if ! diff -u /tmp/go.mod.before go.mod; then
+            echo 'go.mod is not tidy' >&2
+            exit 1
+          fi
+          if ! diff -u /tmp/go.sum.before /tmp/go.sum.after; then
+            echo 'go.sum is not tidy' >&2
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Staticcheck
+        shell: bash
+        run: go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" ./...
+
+      - name: Lint workflows
+        shell: bash
+        run: go run "github.com/rhysd/actionlint/cmd/actionlint@${ACTIONLINT_VERSION}" -color
+
+      - name: Check for known vulnerabilities
+        shell: bash
+        run: go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      # -shuffle=on catches fixtures leaking between cases, which for a socket
+      # server usually means a listener that outlives its test.
+      - name: Test with the race detector
+        run: go test -race -count=1 -shuffle=on -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Report coverage
+        shell: bash
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Fuzz the request allowlist
+        run: go test -run='^$' -fuzz=FuzzClassify -fuzztime=60s ./internal/gangway
+
+      - name: Upload fuzz failures
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-corpus
+          path: internal/gangway/testdata/fuzz/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  binaries:
+    name: Release binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build every target twice
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            for pass in 1 2; do
+              mkdir -p "dist/${pass}"
+              CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+                go build -trimpath -buildvcs=false -ldflags='-s -w' \
+                -o "dist/${pass}/gangway-linux-${arch}" .
+            done
+          done
+
+      - name: Verify the builds are reproducible
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            first=$(sha256sum "dist/1/gangway-linux-${arch}" | cut -d' ' -f1)
+            second=$(sha256sum "dist/2/gangway-linux-${arch}" | cut -d' ' -f1)
+            if [ "${first}" != "${second}" ]; then
+              echo "linux/${arch} is not reproducible: ${first} != ${second}" >&2
+              exit 1
+            fi
+            echo "linux/${arch} ${first}"
+          done
+
+      # scratch has no dynamic loader and no libc. A binary that acquires either
+      # stops being executable there, and the failure is an opaque
+      # "no such file or directory" at exec time.
+      - name: Verify the binaries can run on scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            bin="dist/1/gangway-linux-${arch}"
+            if readelf -l "${bin}" | grep -q 'INTERP'; then
+              echo "${bin} requests a dynamic loader, which scratch does not have" >&2
+              readelf -l "${bin}" | grep -B2 -A2 'INTERP' >&2
+              exit 1
+            fi
+            if readelf -d "${bin}" 2> /dev/null | grep -q 'NEEDED'; then
+              echo "${bin} depends on shared libraries, which scratch does not have" >&2
+              exit 1
+            fi
+            if ! readelf -h "${bin}" | grep -qE 'Type:[[:space:]]+EXEC'; then
+              echo "${bin} is not a static executable:" >&2
+              readelf -h "${bin}" | grep 'Type:' >&2
+              exit 1
+            fi
+            if readelf -S "${bin}" | grep -q '\.symtab'; then
+              echo "${bin} still carries a symbol table; -ldflags=-s -w was lost" >&2
+              exit 1
+            fi
+            echo "${bin}: static ET_EXEC, no interpreter, no shared libraries, stripped"
+          done
+
+      # Binary mode reasons about the artifact that ships, including the exact
+      # standard library linked into it.
+      - name: Scan the shipped artifacts for known vulnerabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            echo "== linux/${arch} =="
+            go run "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}" \
+              -mode=binary "dist/1/gangway-linux-${arch}"
+          done
+
+      - name: Record build provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            for arch in amd64 arm64; do
+              echo "== linux/${arch} =="
+              sha256sum "dist/1/gangway-linux-${arch}"
+              go version -m "dist/1/gangway-linux-${arch}"
+              echo
+            done
+          } | tee dist/provenance.txt
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: gangway-linux
+          path: |
+            dist/1/gangway-linux-amd64
+            dist/1/gangway-linux-arm64
+            dist/provenance.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  image:
+    name: Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REVISION: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check Compose configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)" docker compose config --quiet
+
+      - name: Build image
+        shell: bash
+        run: docker build --pull --build-arg "REVISION=${REVISION}" -t gangway:ci .
+
+      # The build stage cross-compiles from $BUILDPLATFORM, so this needs no
+      # emulation. It is the only check that the arm64 image is assembled
+      # correctly, not merely that arm64 code compiles.
+      - name: Build image for arm64
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --platform linux/arm64 \
+            --build-arg "REVISION=${REVISION}" -t gangway:ci-arm64 .
+          arch=$(docker image inspect --format '{{.Architecture}}' gangway:ci-arm64)
+          test "${arch}" = arm64
+
+      # Layers rather than a running container, to keep the files Docker injects
+      # at runtime (/etc/hosts, /dev, /.dockerenv) out of the comparison.
+      - name: Verify the image contains nothing but the proxy
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/img /tmp/image.tar
+          mkdir -p /tmp/img
+          docker save gangway:ci -o /tmp/image.tar
+          tar -xf /tmp/image.tar -C /tmp/img
+          : > /tmp/contents.txt
+          while IFS= read -r blob; do
+            if tar -tf "${blob}" > /dev/null 2>&1; then
+              tar -tf "${blob}" >> /tmp/contents.txt
+            fi
+          done < <(find /tmp/img -type f)
+          sort -u /tmp/contents.txt > /tmp/actual.txt
+          cat > /tmp/expected.txt <<'EXPECTED'
+          gangway
+          run/
+          run/gangway/
+          EXPECTED
+          if ! diff -u /tmp/expected.txt /tmp/actual.txt; then
+            echo 'image contains unexpected files' >&2
+            exit 1
+          fi
+
+      - name: Verify the image runtime configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(docker image inspect --format '{{.Config.User}}' gangway:ci)" = '1000:1000'
+          test "$(docker image inspect --format '{{json .Config.Entrypoint}}' gangway:ci)" = '["/gangway"]'
+          test "$(docker image inspect --format '{{json .Config.Cmd}}' gangway:ci)" = 'null'
+          test "$(docker image inspect --format '{{.Config.StopSignal}}' gangway:ci)" = SIGTERM
+          test "$(docker image inspect --format '{{json .Config.Healthcheck.Test}}' gangway:ci)" \
+            = '["CMD","/gangway","--healthcheck"]'
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' gangway:ci)" \
+            = "${REVISION}"
+          docker image inspect --format '{{json .Config.Env}}' gangway:ci
+
+      - name: Verify the shipped binary can exec on scratch
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/shipped
+          cid=$(docker create gangway:ci)
+          docker cp "${cid}:/gangway" /tmp/shipped/gangway
+          docker rm -f "${cid}" > /dev/null
+          if readelf -l /tmp/shipped/gangway | grep -q 'INTERP'; then
+            echo 'the shipped binary requests a dynamic loader that scratch lacks' >&2
+            exit 1
+          fi
+          if readelf -d /tmp/shipped/gangway 2> /dev/null | grep -q 'NEEDED'; then
+            echo 'the shipped binary depends on shared libraries' >&2
+            exit 1
+          fi
+          readelf -h /tmp/shipped/gangway | grep -qE 'Type:[[:space:]]+EXEC'
+          sha256sum /tmp/shipped/gangway
+
+      # Both builds run against the base image this job already pulled, so a
+      # moved tag cannot split them.
+      - name: Verify the image build is reproducible
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --no-cache --build-arg "REVISION=${REVISION}" -t gangway:ci-rebuild .
+          cid=$(docker create gangway:ci-rebuild)
+          docker cp "${cid}:/gangway" /tmp/shipped/gangway-rebuild
+          docker rm -f "${cid}" > /dev/null
+          first=$(sha256sum /tmp/shipped/gangway | cut -d' ' -f1)
+          second=$(sha256sum /tmp/shipped/gangway-rebuild | cut -d' ' -f1)
+          if [ "${first}" != "${second}" ]; then
+            echo "image build is not reproducible: ${first} != ${second}" >&2
+            exit 1
+          fi
+          echo "reproducible: ${first}"
+
+      - name: Smoke test the image against Docker
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'docker logs gangway-ci || true; docker rm -f gangway-ci >/dev/null 2>&1 || true; docker volume rm gangway-ci-socket >/dev/null 2>&1 || true' EXIT
+          docker run -d --name gangway-ci --read-only --network none \
+            --cap-drop ALL --security-opt no-new-privileges:true \
+            --label gangway.ci=preserved --env GANGWAY_CI_SECRET=must-not-be-exposed \
+            --group-add "$(stat -c '%g' /var/run/docker.sock)" \
+            --mount type=bind,src=/var/run,dst=/run/docker-host,readonly \
+            --mount type=volume,src=gangway-ci-socket,dst=/run/gangway \
+            --health-interval=1s --health-retries=10 --stop-timeout=70 \
+            gangway:ci --docker-socket=/run/docker-host/docker.sock
+          test "$(docker inspect --format '{{.Config.User}}' gangway-ci)" = '1000:1000'
+          for attempt in {1..30}; do
+            if [ "$(docker inspect --format '{{.State.Health.Status}}' gangway-ci)" = healthy ]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$(docker inspect --format '{{.State.Health.Status}}' gangway-ci)" = healthy
+          docker exec gangway-ci /gangway --healthcheck
+          proxy_socket="$(docker volume inspect --format '{{.Mountpoint}}' gangway-ci-socket)/docker.sock"
+          container_id=$(docker inspect --format '{{.Id}}' gangway-ci)
+          api_version=$(docker version --format '{{.Server.APIVersion}}')
+          sudo curl --fail --silent --show-error --unix-socket "$proxy_socket" \
+            "http://docker/v${api_version}/containers/${container_id}/json" > /tmp/gangway-container.json
+          python3 -c 'import json; d=json.load(open("/tmp/gangway-container.json")); assert d == {"Config": {"Image": "gangway:ci", "Labels": {"gangway.ci": "preserved"}}}, d'
+          sudo curl --fail --silent --show-error --unix-socket "$proxy_socket" \
+            "http://docker/v${api_version}/images/gangway:ci/json" > /tmp/gangway-image.json
+          docker image inspect --format '{{.Id}}' gangway:ci > /tmp/gangway-image-id
+          python3 -c 'import json; d=json.load(open("/tmp/gangway-image.json")); assert set(d) == {"Id", "RepoDigests"}, d; assert d["Id"] == open("/tmp/gangway-image-id").read().strip(), d'
+          test "$(sudo curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --unix-socket "$proxy_socket" http://docker/containers/json)" = 403
+          docker stop gangway-ci
+          test "$(docker inspect --format '{{.State.ExitCode}}' gangway-ci)" = 0
+          docker start gangway-ci
+          for attempt in {1..30}; do
+            if docker exec gangway-ci /gangway --healthcheck; then
+              break
+            fi
+            sleep 1
+          done
+          docker exec gangway-ci /gangway --healthcheck
+          docker stop gangway-ci
+          test "$(docker inspect --format '{{.State.ExitCode}}' gangway-ci)" = 0

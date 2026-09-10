@@ -1,0 +1,10 @@
+# Deny everything, then allow only what the build compiles.
+*
+!go.mod
+!go.sum
+!main.go
+!internal
+!Dockerfile
+!.dockerignore
+
+**/*_test.go
