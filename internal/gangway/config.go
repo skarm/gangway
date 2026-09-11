@@ -8,12 +8,30 @@ import (
 )
 
 // Defaults applied to a zero-valued Config. They are also the documented
-// command-line defaults.
+// command-line defaults, and their product is chosen so that
+// WorstCaseMemoryBytes fits the memory the documented deployment gives the
+// process several times over. Both are far above any real inspect response and
+// any attestation rate a single node produces.
 const (
-	DefaultMaxResponseBytes = 4 << 20 // 4 MiB
-	DefaultMaxConcurrent    = 64
+	DefaultMaxResponseBytes = 1 << 20 // 1 MiB
+	DefaultMaxConcurrent    = 8
 	DefaultUpstreamTimeout  = 5 * time.Second
 )
+
+// responseMemoryFactor is how much live heap one request in flight costs per
+// byte of Docker response it is allowed to read. The JSON itself is the small
+// part: what a container inspect decodes to is a map, and the shape that costs
+// the most per byte is Labels made of many short distinct keys, which alone is
+// nine to twelve times the body it came from. The read buffer holding that body
+// and the re-encoded response built beside it account for the rest.
+//
+// Measured between 7 and 14 in total, across response limits from 512 bytes to
+// 16 MiB, peaking between 8 and 16 KiB and falling above that as a bigger map
+// needs longer keys to fill it. Rounded up from that peak: a bound that only
+// holds for the average response shape, or for the one limit that happened to
+// be measured, is not a bound. The per-connection cost of the HTTP server is
+// not in this figure, being a few KiB against a limit counted in MiB.
+const responseMemoryFactor = 16
 
 // Accepted range for each configurable limit.
 const (
@@ -57,6 +75,19 @@ func (c Config) WithDefaults() Config {
 	}
 
 	return c
+}
+
+// WorstCaseMemoryBytes reports the live heap the handler can hold when every
+// concurrency slot is decoding a response at the size limit. It is the number
+// the process must be given memory for, and raising either limit raises it
+// proportionally.
+//
+// GOMEMLIMIT is not a substitute for this bound. It makes the collector work
+// harder as the heap grows; it cannot reclaim data a request still needs, so
+// a configuration whose worst case does not fit gets an OOM kill instead of
+// back pressure.
+func (c Config) WorstCaseMemoryBytes() int64 {
+	return int64(c.MaxConcurrent) * c.MaxResponseBytes * responseMemoryFactor
 }
 
 // Validate reports whether every limit is within its documented range.

@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/skarm/gangway/internal/gangway"
@@ -135,7 +136,7 @@ func TestCloseKeepsAReplacementSocket(t *testing.T) {
 }
 
 func TestListenRejectsUnsafeFilesAndPermissions(t *testing.T) {
-	for _, kind := range []string{"regular file", "symlink", "lock symlink", "writable directory", "invalid mode"} {
+	for _, kind := range []string{"regular file", "symlink", "lock symlink", "writable directory", "invalid mode", "unclean path"} {
 		t.Run(kind, func(t *testing.T) {
 			dir := socketDir(t)
 			path := filepath.Join(dir, "proxy.sock")
@@ -164,6 +165,10 @@ func TestListenRejectsUnsafeFilesAndPermissions(t *testing.T) {
 				}
 			case "invalid mode":
 				mode = 0o666
+			case "unclean path":
+				// filepath.Dir would read this as dir, while the kernel reads
+				// it as whatever "sub" turns out to be the parent of.
+				path = dir + "/sub/../proxy.sock"
 			}
 
 			if listener, err := gangway.Listen(path, mode); err == nil {
@@ -183,8 +188,14 @@ func TestListenRejectsUnsafeFilesAndPermissions(t *testing.T) {
 }
 
 func TestListenAppliesSocketPermissions(t *testing.T) {
+	// A umask that strips every group bit off anything created under it, which
+	// is what makes the directory mode worth asserting instead of assuming.
+	previous := syscall.Umask(0o077)
+	t.Cleanup(func() { syscall.Umask(previous) })
+
 	for _, mode := range []os.FileMode{0o600, 0o660} {
-		path := filepath.Join(socketDir(t), "proxy.sock")
+		dir := filepath.Join(socketDir(t), "run")
+		path := filepath.Join(dir, "proxy.sock")
 		listener, err := gangway.Listen(path, mode)
 		if err != nil {
 			t.Fatal(err)
@@ -198,5 +209,45 @@ func TestListenAppliesSocketPermissions(t *testing.T) {
 		if info.Mode().Perm() != mode || info.Mode()&os.ModeSocket == 0 {
 			t.Fatalf("socket mode = %v, want socket with %v", info.Mode(), mode)
 		}
+		// The umask must not reach a directory the proxy created for itself:
+		// a 0700 one would leave the 0660 socket above unreachable.
+		dirInfo, err := os.Stat(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dirInfo.Mode().Perm() != 0o750 {
+			t.Fatalf("socket directory mode = %04o, want 0750", dirInfo.Mode().Perm())
+		}
 	}
+}
+
+// TestListenRejectsAGroupSocketInAPrivateDirectory keeps the proxy from
+// serving where nothing can reach it. A directory the operator prepared as
+// 0700 contradicts a socket mode that invites the group in, and a proxy that
+// starts anyway looks healthy while every client gets EACCES on the directory.
+func TestListenRejectsAGroupSocketInAPrivateDirectory(t *testing.T) {
+	dir := socketDir(t)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "proxy.sock")
+
+	if listener, err := gangway.Listen(path, 0o660); err == nil {
+		_ = listener.Close()
+		t.Fatal("0660 socket accepted in a directory its group cannot traverse")
+	}
+	// Nothing may be left behind for the next attempt, including the lock.
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("rejected configuration left %d entries behind", len(entries))
+	}
+	// The same directory is right for a socket only its owner may use.
+	listener, err := gangway.Listen(path, 0o600)
+	if err != nil {
+		t.Fatalf("0600 socket rejected: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
 }

@@ -12,7 +12,10 @@ services:
     command:
       - --docker-socket=/run/docker-host/docker.sock
     environment:
-      # Saturation shows up as GC pressure rather than an OOM kill.
+      # Set above the worst case below with room for the garbage a saturated
+      # decode produces, so saturation shows up as GC pressure rather than an
+      # OOM kill. It cannot substitute for that bound: the collector cannot
+      # reclaim a response a request is still decoding.
       GOMEMLIMIT: 448MiB
     volumes:
       - type: bind
@@ -33,8 +36,13 @@ services:
     stop_grace_period: 70s
     pids_limit: 128
     cpus: 2.0
-    # Worst case in flight is --max-concurrent (64) decodes of
-    # --max-response-bytes (4 MiB) each; lower this together with those flags.
+    # Worst case in flight is --max-concurrent (8) responses at
+    # --max-response-bytes (1 MiB), and each costs up to sixteen times the JSON
+    # it came from once decoded: 128 MiB of live heap, which GOMEMLIMIT above
+    # leaves the collector room over. Raising either flag raises that
+    # proportionally, and needs both limits raised with it; the proxy logs
+    # worst_case_memory_bytes at start-up and warns when GOMEMLIMIT no longer
+    # covers twice it.
     mem_limit: 512m
     mem_reservation: 32m
     # Headroom over 4 x --max-concurrent connections plus one upstream socket

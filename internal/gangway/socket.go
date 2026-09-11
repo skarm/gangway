@@ -60,6 +60,14 @@ func Listen(path string, mode os.FileMode) (net.Listener, error) {
 	if !filepath.IsAbs(path) {
 		return nil, errors.New("listen socket path must be absolute")
 	}
+	// Everything below reads the socket's directory and lock name off this
+	// path with filepath.Dir and a suffix, which resolve ".." lexically while
+	// the kernel resolves it after the symlink before it. Requiring a clean
+	// path keeps the two from naming different directories, rather than
+	// checking one and binding in the other.
+	if filepath.Clean(path) != path {
+		return nil, fmt.Errorf(`listen socket path must be clean, without "..", "." or repeated separators: %q`, path)
+	}
 
 	if mode != 0o600 && mode != 0o660 {
 		return nil, errors.New("socket permissions must be 0600 or 0660")
@@ -67,8 +75,8 @@ func Listen(path string, mode os.FileMode) (net.Listener, error) {
 
 	dir := filepath.Dir(path)
 
-	if err := os.MkdirAll(dir, socketDirMode); err != nil {
-		return nil, fmt.Errorf("create socket directory: %w", err)
+	if err := createSocketDir(dir); err != nil {
+		return nil, err
 	}
 
 	dirInfo, err := os.Stat(dir)
@@ -78,6 +86,15 @@ func Listen(path string, mode os.FileMode) (net.Listener, error) {
 
 	if !privateToEffectiveUser(dirInfo) {
 		return nil, errors.New("socket directory must be owned by the current user and not writable by group or others")
+	}
+	// A socket the group may use is only reachable if the group may also
+	// traverse the directory holding it. Serving on one it cannot is a running
+	// proxy no client can reach, which is worse than refusing to start. Only
+	// this directory is checked: it is the one that travels with the socket
+	// into the client's mount namespace, while its parents are the operator's
+	// to arrange and may not even be the parents the client sees.
+	if mode&0o060 != 0 && dirInfo.Mode().Perm()&0o010 == 0 {
+		return nil, fmt.Errorf("socket mode %04o needs a group-traversable socket directory, but %q is mode %04o", mode, dir, dirInfo.Mode().Perm())
 	}
 
 	lock, err := acquireInstanceLock(path + lockSuffix)
@@ -104,6 +121,49 @@ func Listen(path string, mode os.FileMode) (net.Listener, error) {
 	keepLock = true
 
 	return &unixListener{UnixListener: listener, path: path, info: info, lock: lock}, nil
+}
+
+// createSocketDir creates dir, and any missing parent of it, with
+// socketDirMode. The mode is applied after the fact because Mkdir takes the
+// process umask into account: under a umask of 077 the directory would come
+// out 0700, and a 0660 socket inside it would be unreachable for the group the
+// mode was widened for. A directory that already exists is left exactly as the
+// operator prepared it, and checked by the caller instead.
+func createSocketDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("socket directory is not a directory: %q", dir)
+		}
+
+		return nil
+	}
+
+	if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect socket directory: %w", err)
+	}
+
+	if parent := filepath.Dir(dir); parent != dir {
+		if err := createSocketDir(parent); err != nil {
+			return err
+		}
+	}
+
+	if err := os.Mkdir(dir, socketDirMode); err != nil {
+		// Someone else created it between the Stat above and here, so it is
+		// theirs to have set up; the caller still has to approve it.
+		if errors.Is(err, os.ErrExist) {
+			return nil
+		}
+
+		return fmt.Errorf("create socket directory: %w", err)
+	}
+
+	if err := os.Chmod(dir, socketDirMode); err != nil {
+		return fmt.Errorf("set socket directory permissions: %w", err)
+	}
+
+	return nil
 }
 
 // acquireInstanceLock opens and exclusively locks the instance lock file. The

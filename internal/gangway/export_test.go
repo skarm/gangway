@@ -20,6 +20,10 @@ func DecodeJSON(r io.Reader, maxBytes int64, dst any) error { return decodeJSON(
 // PathForLog exposes the log-path truncation.
 func PathForLog(path string) string { return pathForLog(path) }
 
+// ResolvePath exposes the symlink resolver, so it can be held against the
+// standard library's for paths that exist in full.
+func ResolvePath(path string) (string, error) { return resolvePath(path) }
+
 // InFlight reports how many upstream requests currently hold a slot.
 func (h *Handler) InFlight() int { return len(h.inFlight) }
 

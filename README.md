@@ -52,11 +52,20 @@ Flags (`--help` for the full list):
 - `--docker-socket=/var/run/docker.sock`
 - `--socket-mode=0600` (or `0660`)
 - `--upstream-timeout=5s` (100ms to 1m)
-- `--max-response-bytes=4194304` (1 byte to 64 MiB of upstream JSON)
-- `--max-concurrent=64` (1 to 4096; the listener accepts at most four
+- `--max-response-bytes=1048576` (1 byte to 64 MiB of upstream JSON)
+- `--max-concurrent=8` (1 to 4096; the listener accepts at most four
   connections per slot)
 - `--shutdown-timeout=0` (0 means upstream timeout plus 5s; explicit up to 2m)
 - `--log-level=info` (`debug`, `info`, `warn` or `error`)
+
+`--max-response-bytes` and `--max-concurrent` together decide how much memory
+the process needs. A response costs up to sixteen times its own size in live
+heap once decoded — the JSON is the small part, the map its labels decode into
+is not — so the worst case in flight is their product times 16, logged as
+`worst_case_memory_bytes` at start-up: 128 MiB at the defaults. Give the process
+at least twice that, and expect a warning in the log when `GOMEMLIMIT` is set
+below it. `GOMEMLIMIT` on its own only makes the collector work harder; it
+cannot reclaim a response a request is still decoding.
 
 Out-of-range values exit with status 2 without touching either socket. On
 `SIGTERM`/`SIGINT` the service stops accepting connections and drains within the
@@ -85,10 +94,15 @@ network, dropped capabilities, and its own health check.
   the proxy's UID and never writable by others.
 - `stop_grace_period` is 70s, which covers the automatic shutdown timeout for
   all supported upstream settings. Raise it for a longer explicit timeout.
+- `mem_limit` and `GOMEMLIMIT` are sized for the default response and
+  concurrency limits. Raise them along with those flags, never the flags alone.
 
 The socket defaults to mode `0600`, so SPIRE must run as UID 1000 or root. For
 a separate SPIRE UID, use `--socket-mode=0660` and give SPIRE GID 1000; only
-trusted clients should belong to that group.
+trusted clients should belong to that group. The socket's directory has to let
+that group through as well: the proxy creates one as `0750` whatever the umask
+says, and refuses to serve a `0660` socket from a directory prepared without
+group access, rather than running where no client can reach it.
 
 ## Connect SPIRE
 
@@ -127,6 +141,10 @@ selectors against your own SPIRE and Docker versions before rollout.
   single request from growing without bounds; saturation returns HTTP 503.
   Idle accepted connections are reaped after two seconds without a request
   header, or a 30-second keep-alive idle timeout.
+- Those same two limits are the memory bound described under the flags, and the
+  response that reaches it is an ordinary one: nothing about a container
+  whose labels are many short keys is hostile. Sizing them past the memory the
+  process has turns a burst of attestations into an OOM kill.
 - Docker failures and invalid responses return sanitized errors. Logs are JSON
   on stdout and never contain Docker response bodies.
 - At the default level the log carries start-up, shutdown, and faults in the

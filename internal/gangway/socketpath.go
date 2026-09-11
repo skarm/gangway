@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // maxPathComponents budgets both symlink hops and path depth while resolving.
@@ -54,47 +55,80 @@ func ValidatePaths(listenPath, dockerPath string) error {
 	return nil
 }
 
-// resolvePath expands existing symlinks in path, including in the parents of a
-// socket that does not exist yet. filepath.EvalSymlinks cannot be used here
-// because it requires the whole path to exist.
+// resolvePath expands existing symlinks in an absolute path, including in the
+// parents of a socket that does not exist yet. filepath.EvalSymlinks cannot be
+// used here because it requires the whole path to exist.
+//
+// Components are applied from the root outwards and ".." is resolved against
+// the prefix already expanded, which is the order the kernel reads a path in.
+// Cleaning the path up front instead would remove ".." lexically and rewrite
+// "dir/link/.." into "dir", naming a directory the path never referred to: a
+// listen socket spelled that way could still land on the Docker socket.
 func resolvePath(path string) (string, error) {
-	return resolvePathWithin(path, maxPathComponents)
+	root := string(filepath.Separator)
+	resolved := root
+	pending := pathComponents(path)
+
+	// One budget for depth and symlink hops together, since expanding a link
+	// puts its target's components back in the queue.
+	for budget := maxPathComponents; len(pending) > 0; budget-- {
+		if budget == 0 {
+			return "", errors.New("too many symlinks or path components in socket path")
+		}
+
+		name, rest := pending[0], pending[1:]
+		pending = rest
+
+		switch name {
+		case ".":
+			continue
+		case "..":
+			resolved = filepath.Dir(resolved)
+			continue
+		}
+
+		next := filepath.Join(resolved, name)
+
+		info, err := os.Lstat(next)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			// There is nothing to expand below a component that does not exist
+			// yet, but the components after it still apply to it.
+			resolved = next
+		case err != nil:
+			return "", fmt.Errorf("resolve socket path %q: %w", next, err)
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := os.Readlink(next)
+			if err != nil {
+				return "", fmt.Errorf("resolve socket path %q: %w", next, err)
+			}
+			// A relative target is read from the directory holding the link,
+			// which is what resolved already names.
+			if filepath.IsAbs(target) {
+				resolved = root
+			}
+
+			pending = append(pathComponents(target), rest...)
+		default:
+			resolved = next
+		}
+	}
+
+	return resolved, nil
 }
 
-func resolvePathWithin(path string, remaining int) (string, error) {
-	if remaining == 0 {
-		return "", errors.New("too many symlinks or path components in socket path")
-	}
+// pathComponents splits path into the names resolvePath applies one at a time,
+// dropping the empty strings that leading, trailing and repeated separators
+// produce.
+func pathComponents(path string) []string {
+	parts := strings.Split(path, string(filepath.Separator))
+	components := make([]string, 0, len(parts))
 
-	path = filepath.Clean(path)
-
-	info, err := os.Lstat(path)
-	if err == nil && info.Mode()&os.ModeSymlink != 0 {
-		target, err := os.Readlink(path)
-		if err != nil {
-			return "", err
+	for _, part := range parts {
+		if part != "" {
+			components = append(components, part)
 		}
-
-		if !filepath.IsAbs(target) {
-			target = filepath.Join(filepath.Dir(path), target)
-		}
-
-		return resolvePathWithin(target, remaining-1)
 	}
 
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("resolve socket path %q: %w", path, err)
-	}
-
-	parent := filepath.Dir(path)
-	if parent == path {
-		return path, err
-	}
-
-	resolvedParent, err := resolvePathWithin(parent, remaining-1)
-	if err != nil {
-		return "", err
-	}
-
-	return filepath.Join(resolvedParent, filepath.Base(path)), nil
+	return components
 }

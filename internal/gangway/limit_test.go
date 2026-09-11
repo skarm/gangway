@@ -93,9 +93,14 @@ func TestLimitConnectionsUnblocksAcceptOnClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	if _, err := listener.Accept(); err != nil {
+	// The accepted connection has to be closed by the test: closing the
+	// listener and the client side leaves the server side open, holding its
+	// descriptor until a finalizer runs.
+	served, err := listener.Accept()
+	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = served.Close() })
 
 	blocked := make(chan error, 1)
 	go func() {

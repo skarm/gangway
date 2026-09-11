@@ -347,7 +347,7 @@ jobs:
             --health-interval=1s --health-retries=10 --stop-timeout=70 \
             gangway:ci --docker-socket=/run/docker-host/docker.sock
           test "$(docker inspect --format '{{.Config.User}}' gangway-ci)" = '1000:1000'
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             if [ "$(docker inspect --format '{{.State.Health.Status}}' gangway-ci)" = healthy ]; then
               break
             fi
@@ -359,10 +359,26 @@ jobs:
           container_id=$(docker inspect --format '{{.Id}}' gangway-ci)
           api_version=$(docker version --format '{{.Server.APIVersion}}')
           sudo curl --fail --silent --show-error --unix-socket "$proxy_socket" \
-            "http://docker/v${api_version}/containers/${container_id}/json" > /tmp/gangway-container.json
-          python3 -c 'import json; d=json.load(open("/tmp/gangway-container.json")); assert d == {"Config": {"Image": "gangway:ci", "Labels": {"gangway.ci": "preserved"}}}, d'
+            --output /tmp/gangway-container.json \
+            "http://docker/v${api_version}/containers/${container_id}/json"
+          # What the daemon itself reports, so that adding a LABEL to the
+          # Dockerfile cannot turn "the proxy dropped a label" into a passing
+          # run. Container labels carry the image's as well as docker run's.
+          docker inspect --format '{{.Config.Image}}' gangway-ci > /tmp/gangway-expected-image
+          docker inspect --format '{{json .Config.Labels}}' gangway-ci > /tmp/gangway-expected-labels.json
+          python3 - <<'CHECK'
+          import json
+          body = open("/tmp/gangway-container.json").read()
+          got = json.loads(body)
+          assert set(got) == {"Config"}, got
+          assert set(got["Config"]) == {"Image", "Labels"}, got
+          assert got["Config"]["Image"] == open("/tmp/gangway-expected-image").read().strip(), got
+          assert got["Config"]["Labels"] == json.load(open("/tmp/gangway-expected-labels.json")), got
+          assert "must-not-be-exposed" not in body, "the container environment reached the client"
+          CHECK
           sudo curl --fail --silent --show-error --unix-socket "$proxy_socket" \
-            "http://docker/v${api_version}/images/gangway:ci/json" > /tmp/gangway-image.json
+            --output /tmp/gangway-image.json \
+            "http://docker/v${api_version}/images/gangway:ci/json"
           docker image inspect --format '{{.Id}}' gangway:ci > /tmp/gangway-image-id
           python3 -c 'import json; d=json.load(open("/tmp/gangway-image.json")); assert set(d) == {"Id", "RepoDigests"}, d; assert d["Id"] == open("/tmp/gangway-image-id").read().strip(), d'
           test "$(sudo curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
@@ -370,7 +386,7 @@ jobs:
           docker stop gangway-ci
           test "$(docker inspect --format '{{.State.ExitCode}}' gangway-ci)" = 0
           docker start gangway-ci
-          for attempt in {1..30}; do
+          for _ in {1..30}; do
             if docker exec gangway-ci /gangway --healthcheck; then
               break
             fi

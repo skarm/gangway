@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 )
@@ -22,6 +24,11 @@ const (
 	// slot allows. Excess requests already receive 503; this bound keeps a
 	// client that leaks sockets from exhausting the file-descriptor limit.
 	connectionsPerRequest = 4
+	// memoryHeadroomFactor is how much room over Config.WorstCaseMemoryBytes
+	// the collector needs for the garbage a saturated proxy produces while
+	// holding that much live. Below it, saturation stops being GC pressure and
+	// becomes an OOM kill.
+	memoryHeadroomFactor = 2
 )
 
 // Exit codes. Usage errors are separated from runtime failures so a supervisor
@@ -116,7 +123,9 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) error {
 		"max_concurrent", proxy.MaxConcurrent,
 		"max_connections", maxConnections,
 		"upstream_timeout", proxy.UpstreamTimeout.String(),
+		"worst_case_memory_bytes", proxy.WorstCaseMemoryBytes(),
 	)
+	warnOnMemoryLimit(log, proxy)
 
 	err = Serve(ctx, server, listener, shutdownTimeout)
 	if err == nil {
@@ -124,4 +133,34 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) error {
 	}
 
 	return err
+}
+
+// warnOnMemoryLimit reports limits the process does not have the memory for.
+// It is the one place the size and concurrency flags are checked against what
+// the runtime was actually given, which is what keeps the two from drifting:
+// raising either flag without raising GOMEMLIMIT is how a saturated proxy gets
+// killed instead of merely slowed down. It is a warning rather than a refusal
+// because the worst case needs every slot to hold a maximal response at once,
+// which a given deployment may never see.
+func warnOnMemoryLimit(log *slog.Logger, proxy Config) {
+	// A negative argument reads the limit without setting it, and reports
+	// math.MaxInt64 when GOMEMLIMIT is unset. An operator who has not capped
+	// the heap has not told us anything to check against.
+	limit := debug.SetMemoryLimit(-1)
+	if limit == math.MaxInt64 {
+		return
+	}
+
+	worstCase := proxy.WorstCaseMemoryBytes()
+	if worstCase*memoryHeadroomFactor <= limit {
+		return
+	}
+
+	log.Warn("configured limits exceed the memory this process was given",
+		"memory_limit_bytes", limit,
+		"worst_case_memory_bytes", worstCase,
+		"required_memory_bytes", worstCase*memoryHeadroomFactor,
+		"max_concurrent", proxy.MaxConcurrent,
+		"max_response_bytes", proxy.MaxResponseBytes,
+	)
 }
