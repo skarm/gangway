@@ -114,10 +114,7 @@ func TestWorstCaseMemoryBoundsASaturatedProxy(t *testing.T) {
 
 		var slots sync.WaitGroup
 		for i := range decoded {
-			slots.Add(1)
-			go func() {
-				defer slots.Done()
-
+			slots.Go(func() {
 				if err := decodeJSON(bytes.NewReader(body), cfg.MaxResponseBytes, &decoded[i]); err != nil {
 					t.Error(err)
 					return
@@ -130,7 +127,7 @@ func TestWorstCaseMemoryBoundsASaturatedProxy(t *testing.T) {
 				}
 
 				encoded[i] = buf
-			}()
+			})
 		}
 		slots.Wait()
 		if t.Failed() {

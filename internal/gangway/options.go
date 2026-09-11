@@ -19,6 +19,10 @@ const (
 	minShutdownTimeout = 100 * time.Millisecond
 	maxShutdownTimeout = 2 * time.Minute
 
+	// maxListEntries bounds a comma-separated option. An allowlist needing more
+	// entries than this is not an allowlist any more.
+	maxListEntries = 64
+
 	defaultLogLevel = "info"
 )
 
@@ -46,6 +50,9 @@ type Options struct {
 	LogLevel slog.Level
 	// Healthcheck selects the probe mode instead of serving.
 	Healthcheck bool
+	// Peers restricts which local processes may use the listen socket. The zero
+	// value allows everyone the socket permissions admit.
+	Peers PeerPolicy
 	// Proxy configures the request handler.
 	Proxy Config
 }
@@ -56,6 +63,9 @@ func Parse(args []string, output io.Writer) (Options, error) {
 	var opts Options
 	var socketMode string
 	var logLevel string
+	var allowUID string
+	var allowGID string
+	var labelPrefixes string
 
 	flags := flag.NewFlagSet("gangway", flag.ContinueOnError)
 	flags.SetOutput(output)
@@ -68,6 +78,10 @@ func Parse(args []string, output io.Writer) (Options, error) {
 	flags.StringVar(&socketMode, "socket-mode", "0600", "listen socket permissions: 0600 or 0660 (shared primary group)")
 	flags.StringVar(&logLevel, "log-level", defaultLogLevel, "lowest level written to stdout: debug, info, warn or error")
 	flags.BoolVar(&opts.Healthcheck, "healthcheck", false, "check Docker availability through the listen socket and exit")
+	flags.IntVar(&opts.Proxy.MaxRate, "max-rate", DefaultMaxRate, "maximum Docker API requests per second (0 disables the limit)")
+	flags.StringVar(&allowUID, "allow-uid", "", "comma-separated peer user IDs allowed on the listen socket (empty allows any)")
+	flags.StringVar(&allowGID, "allow-gid", "", "comma-separated peer primary group IDs allowed on the listen socket (empty allows any)")
+	flags.StringVar(&labelPrefixes, "label-prefix", "", "comma-separated container label key prefixes to relay (empty relays every label)")
 
 	if err := flags.Parse(args); err != nil {
 		return Options{}, err
@@ -94,6 +108,26 @@ func Parse(args []string, output io.Writer) (Options, error) {
 	if opts.ShutdownTimeout != 0 && (opts.ShutdownTimeout < minShutdownTimeout || opts.ShutdownTimeout > maxShutdownTimeout) {
 		return Options{}, fmt.Errorf("shutdown-timeout must be between %s and %s, or 0 for automatic", minShutdownTimeout, maxShutdownTimeout)
 	}
+
+	if opts.Peers.UIDs, err = parseIDList("allow-uid", allowUID); err != nil {
+		return Options{}, err
+	}
+
+	if opts.Peers.GIDs, err = parseIDList("allow-gid", allowGID); err != nil {
+		return Options{}, err
+	}
+	// A policy that cannot be enforced here would otherwise be accepted and
+	// silently do nothing, which is the one outcome an access check must not
+	// have. The proxy targets Linux; this only fires when it is run elsewhere.
+	if !opts.Peers.Empty() {
+		if err := supportPeerCredentials(); err != nil {
+			return Options{}, err
+		}
+	}
+
+	if opts.Proxy.LabelPrefixes, err = splitList("label-prefix", labelPrefixes); err != nil {
+		return Options{}, err
+	}
 	// Every proxy flag carries a non-zero default, so an out-of-range value is
 	// a usage error rather than a request for the default.
 	if err := opts.Proxy.Validate(); err != nil {
@@ -101,4 +135,57 @@ func Parse(args []string, output io.Writer) (Options, error) {
 	}
 
 	return opts, nil
+}
+
+// parseIDList reads a comma-separated list of numeric user or group IDs. An
+// empty string is no constraint at all; an entry that is not a plain number is a
+// usage error rather than an ID silently skipped.
+func parseIDList(name, value string) ([]uint32, error) {
+	fields, err := splitList(name, value)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(fields) == 0 {
+		return nil, nil
+	}
+
+	ids := make([]uint32, 0, len(fields))
+
+	for _, field := range fields {
+		id, err := strconv.ParseUint(field, 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("%s must be a comma-separated list of numeric IDs: %q", name, field)
+		}
+
+		ids = append(ids, uint32(id))
+	}
+
+	return ids, nil
+}
+
+// splitList splits and trims a comma-separated option, rejecting empty entries
+// so that a trailing comma cannot turn into a prefix matching everything.
+func splitList(name, value string) ([]string, error) {
+	if strings.TrimSpace(value) == "" {
+		return nil, nil
+	}
+
+	parts := strings.Split(value, ",")
+	if len(parts) > maxListEntries {
+		return nil, fmt.Errorf("%s accepts at most %d entries", name, maxListEntries)
+	}
+
+	fields := make([]string, 0, len(parts))
+
+	for _, part := range parts {
+		field := strings.TrimSpace(part)
+		if field == "" {
+			return nil, fmt.Errorf("%s contains an empty entry; omit the option to leave it unset", name)
+		}
+
+		fields = append(fields, field)
+	}
+
+	return fields, nil
 }

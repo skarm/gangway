@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -29,17 +30,32 @@ func TestParseDefaults(t *testing.T) {
 		opts.Proxy.UpstreamTimeout != gangway.DefaultUpstreamTimeout ||
 		opts.Proxy.MaxResponseBytes != gangway.DefaultMaxResponseBytes ||
 		opts.Proxy.MaxConcurrent != gangway.DefaultMaxConcurrent ||
+		opts.Proxy.MaxRate != gangway.DefaultMaxRate ||
+		len(opts.Proxy.LabelPrefixes) != 0 ||
+		!opts.Peers.Empty() ||
 		opts.LogLevel != slog.LevelInfo {
 		t.Fatalf("unexpected defaults: %+v", opts)
 	}
 
 	opts, err = gangway.Parse([]string{
 		"--socket-mode=0660", "--upstream-timeout=30s", "--shutdown-timeout=1m", "--healthcheck",
-		"--log-level=DEBUG",
+		"--log-level=DEBUG", "--max-rate=0", "--label-prefix=spiffe.io/, com.example/",
 	}, io.Discard)
 	if err != nil || opts.SocketMode != 0o660 || opts.Proxy.UpstreamTimeout != 30*time.Second ||
-		opts.ShutdownTimeout != time.Minute || !opts.Healthcheck || opts.LogLevel != slog.LevelDebug {
+		opts.ShutdownTimeout != time.Minute || !opts.Healthcheck || opts.LogLevel != slog.LevelDebug ||
+		opts.Proxy.MaxRate != 0 ||
+		!slices.Equal(opts.Proxy.LabelPrefixes, []string{"spiffe.io/", "com.example/"}) {
 		t.Fatalf("custom options = %+v, error = %v", opts, err)
+	}
+
+	// A peer policy is only parsed here; whether it can be enforced is decided
+	// by the platform, and refused at parse time where it cannot be.
+	if gangway.PeerCredentialsSupported() {
+		opts, err = gangway.Parse([]string{"--allow-uid=1001,0", "--allow-gid=50"}, io.Discard)
+		if err != nil || !slices.Equal(opts.Peers.UIDs, []uint32{1001, 0}) ||
+			!slices.Equal(opts.Peers.GIDs, []uint32{50}) {
+			t.Fatalf("peer policy = %+v, error = %v", opts.Peers, err)
+		}
 	}
 
 	if _, err := gangway.Parse([]string{"--help"}, io.Discard); !errors.Is(err, flag.ErrHelp) {
@@ -60,6 +76,10 @@ func TestParseRejectsOutOfRangeFlags(t *testing.T) {
 		{"--max-concurrent=0"}, {"--max-concurrent=-1"}, {"--max-concurrent=4097"},
 		{"--upstream-timeout=0"}, {"--upstream-timeout=1ms"}, {"--upstream-timeout=61s"},
 		{"--log-level="}, {"--log-level=trace"}, {"--log-level=INFO+1"},
+		{"--max-rate=-1"}, {"--max-rate=100001"}, {"--max-rate=abc"},
+		{"--allow-uid=nobody"}, {"--allow-uid=-1"}, {"--allow-uid=1000,"}, {"--allow-uid=,"},
+		{"--allow-gid=wheel"}, {"--allow-gid=4294967296"},
+		{"--label-prefix=a,,b"}, {"--label-prefix=,"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
 			if _, err := gangway.Parse(args, io.Discard); err == nil {

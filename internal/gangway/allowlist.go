@@ -99,11 +99,20 @@ func Classify(r *http.Request) (Route, bool) {
 	return Route{}, false
 }
 
-// trimAround returns the part of s between prefix and suffix.
+// trimAround returns the part of s between prefix and suffix. The suffix is
+// matched against what follows the prefix rather than against the whole string,
+// so the two cannot overlap: "/images/json" is Docker's image *list* endpoint,
+// and matching "/json" against the full string would leave "json" behind as if
+// it were an image reference and forward the list request upstream.
 func trimAround(s, prefix, suffix string) (string, bool) {
-	if !strings.HasPrefix(s, prefix) || !strings.HasSuffix(s, suffix) {
+	if !strings.HasPrefix(s, prefix) {
 		return "", false
 	}
 
-	return strings.TrimSuffix(strings.TrimPrefix(s, prefix), suffix), true
+	rest := s[len(prefix):]
+	if !strings.HasSuffix(rest, suffix) {
+		return "", false
+	}
+
+	return rest[:len(rest)-len(suffix)], true
 }

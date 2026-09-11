@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 )
 
@@ -16,6 +17,12 @@ const (
 	DefaultMaxResponseBytes = 1 << 20 // 1 MiB
 	DefaultMaxConcurrent    = 8
 	DefaultUpstreamTimeout  = 5 * time.Second
+	// DefaultMaxRate is the command-line default only; it is not applied by
+	// WithDefaults, where zero means "no rate limit" rather than "unset". Two
+	// inspects per workload attestation puts it around twenty-five attestations
+	// a second sustained, which is far above what a single node produces and
+	// far below what a loop can ask of the daemon.
+	DefaultMaxRate = 50
 )
 
 // responseMemoryFactor is how much live heap one request in flight costs per
@@ -37,8 +44,12 @@ const responseMemoryFactor = 16
 const (
 	maxResponseBytesLimit = 64 << 20
 	maxConcurrentLimit    = 4096
+	maxRateLimit          = 100_000
 	minUpstreamTimeout    = 100 * time.Millisecond
 	maxUpstreamTimeout    = time.Minute
+	// maxLabelPrefixes bounds the allowlist so a filter cannot cost more per
+	// label than reading the label did.
+	maxLabelPrefixes = 64
 )
 
 // Config describes one proxy handler. The zero value is usable through
@@ -53,6 +64,18 @@ type Config struct {
 	MaxConcurrent int
 	// UpstreamTimeout bounds a single Docker request, dial through body.
 	UpstreamTimeout time.Duration
+	// MaxRate caps how many requests a second may be forwarded to Docker; the
+	// rest receive 429. Zero means no limit. It bounds sustained load on the
+	// daemon, which MaxConcurrent does not: slots that turn over quickly are
+	// unbounded work over time. The bucket holds four seconds of requests, so a
+	// burst of attestations is absorbed rather than refused.
+	MaxRate int
+	// LabelPrefixes, when set, keeps only the container labels whose key starts
+	// with one of them. Empty relays every label Docker reports. Labels are
+	// preserved for selectors, but they routinely carry orchestrator
+	// annotations, and an allowlist is the only thing that keeps a label added
+	// somewhere else from reaching this proxy's clients.
+	LabelPrefixes []string
 	// Logger receives denial and failure records. Defaults to slog.Default.
 	Logger *slog.Logger
 }
@@ -61,6 +84,10 @@ type Config struct {
 // Command-line flags carry the same defaults, so a caller that parses flags
 // only needs Validate: there, a zero is an out-of-range value rather than a
 // request for the default.
+//
+// MaxRate is the exception and is left alone: zero is a meaningful value there,
+// so a Config built in code is unlimited unless it says otherwise, while the
+// command line applies DefaultMaxRate itself.
 func (c Config) WithDefaults() Config {
 	if c.MaxResponseBytes == 0 {
 		c.MaxResponseBytes = DefaultMaxResponseBytes
@@ -106,6 +133,18 @@ func (c Config) Validate() error {
 
 	if c.UpstreamTimeout < minUpstreamTimeout || c.UpstreamTimeout > maxUpstreamTimeout {
 		return fmt.Errorf("upstream timeout must be between %s and %s", minUpstreamTimeout, maxUpstreamTimeout)
+	}
+
+	if c.MaxRate < 0 || c.MaxRate > maxRateLimit {
+		return fmt.Errorf("max rate must be between 0 and %d", maxRateLimit)
+	}
+
+	if len(c.LabelPrefixes) > maxLabelPrefixes {
+		return fmt.Errorf("at most %d label prefixes may be configured", maxLabelPrefixes)
+	}
+
+	if slices.Contains(c.LabelPrefixes, "") {
+		return errors.New("label prefixes must not be empty; omit the option to keep every label")
 	}
 
 	return nil

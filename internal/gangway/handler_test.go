@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/skarm/gangway/internal/gangway"
 )
@@ -62,6 +63,87 @@ func TestContainerInspectKeepsOnlyImageAndLabels(t *testing.T) {
 	}
 	if want := map[string]any{"service": "api", "env": "prod"}; !reflect.DeepEqual(cfg["Labels"], want) {
 		t.Fatalf("Labels = %#v, want %#v", cfg["Labels"], want)
+	}
+}
+
+// TestLabelPrefixesRestrictWhatLeavesTheProxy covers the data-minimisation
+// option: labels are relayed for selectors, but a container's labels routinely
+// carry whatever the orchestrator put there, and an allowlist is the only thing
+// that keeps a label added elsewhere from reaching this proxy's clients.
+func TestLabelPrefixesRestrictWhatLeavesTheProxy(t *testing.T) {
+	const body = `{"Config":{"Image":"app:v1","Labels":{
+		"spiffe.io/team":"payments",
+		"com.example/tier":"web",
+		"secret.internal/token":"must-not-be-relayed",
+		"org.opencontainers.image.source":"https://example.invalid"
+	}},"Env":["SECRET=hidden"]}`
+
+	for name, tc := range map[string]struct {
+		prefixes []string
+		want     map[string]string
+	}{
+		"no allowlist relays every label": {
+			prefixes: nil,
+			want: map[string]string{
+				"spiffe.io/team":                  "payments",
+				"com.example/tier":                "web",
+				"secret.internal/token":           "must-not-be-relayed",
+				"org.opencontainers.image.source": "https://example.invalid",
+			},
+		},
+		"one prefix": {
+			prefixes: []string{"spiffe.io/"},
+			want:     map[string]string{"spiffe.io/team": "payments"},
+		},
+		"several prefixes": {
+			prefixes: []string{"spiffe.io/", "com.example/"},
+			want: map[string]string{
+				"spiffe.io/team":   "payments",
+				"com.example/tier": "web",
+			},
+		},
+		"nothing matches": {
+			prefixes: []string{"absent."},
+			want:     map[string]string{},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			socket := startDocker(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, body)
+			}))
+			h := newHandlerWithConfig(t, gangway.Config{
+				DockerSocket:    socket,
+				UpstreamTimeout: time.Second,
+				LabelPrefixes:   tc.prefixes,
+			})
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1.55/containers/"+testContainerID+"/json", nil))
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+			}
+
+			var got struct {
+				Config struct {
+					Image  string            `json:"Image"`
+					Labels map[string]string `json:"Labels"`
+				} `json:"Config"`
+			}
+			if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+
+			if got.Config.Image != "app:v1" {
+				t.Errorf("image = %q, want app:v1", got.Config.Image)
+			}
+			if !reflect.DeepEqual(got.Config.Labels, tc.want) {
+				t.Errorf("labels = %#v, want %#v", got.Config.Labels, tc.want)
+			}
+			if strings.Contains(rr.Body.String(), "hidden") {
+				t.Errorf("environment reached the client: %s", rr.Body.String())
+			}
+		})
 	}
 }
 

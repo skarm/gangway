@@ -383,6 +383,15 @@ jobs:
           python3 -c 'import json; d=json.load(open("/tmp/gangway-image.json")); assert set(d) == {"Id", "RepoDigests"}, d; assert d["Id"] == open("/tmp/gangway-image-id").read().strip(), d'
           test "$(sudo curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
             --unix-socket "$proxy_socket" http://docker/containers/json)" = 403
+          # The collection endpoints share the inspect prefix and suffix, so they
+          # pass any matcher that tests the suffix against the whole path. Held
+          # against the real daemon, which would answer them with every image or
+          # container on the host.
+          for collection in images containers networks volumes; do
+            code=$(sudo curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+              --unix-socket "$proxy_socket" "http://docker/v${api_version}/${collection}/json")
+            test "$code" = 403 || { echo "${collection} list reached Docker: HTTP ${code}" >&2; exit 1; }
+          done
           docker stop gangway-ci
           test "$(docker inspect --format '{{.State.ExitCode}}' gangway-ci)" = 0
           docker start gangway-ci

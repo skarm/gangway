@@ -43,6 +43,10 @@ func TestConfigDefaultsAndBoundaries(t *testing.T) {
 		"negative timeout":     {DockerSocket: "/unused.sock", UpstreamTimeout: -time.Second},
 		"short timeout":        {DockerSocket: "/unused.sock", UpstreamTimeout: 100*time.Millisecond - 1},
 		"long timeout":         {DockerSocket: "/unused.sock", UpstreamTimeout: time.Minute + 1},
+		"negative rate":        {DockerSocket: "/unused.sock", MaxRate: -1},
+		"large rate":           {DockerSocket: "/unused.sock", MaxRate: 100_001},
+		"empty label prefix":   {DockerSocket: "/unused.sock", LabelPrefixes: []string{"spiffe.io/", ""}},
+		"too many prefixes":    {DockerSocket: "/unused.sock", LabelPrefixes: make([]string, 65)},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if err := cfg.WithDefaults().Validate(); err == nil {

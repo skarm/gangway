@@ -3,6 +3,7 @@ package gangway
 import (
 	"errors"
 	"net/http"
+	"strings"
 )
 
 // containerConfig is the only part of a container inspect response that leaves
@@ -37,7 +38,36 @@ func (h *Handler) handleContainerInspect(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	writeJSON(w, http.StatusOK, containerResponse{Config: *decoded.Config})
+	config := *decoded.Config
+	config.Labels = h.filterLabels(config.Labels)
+
+	writeJSON(w, http.StatusOK, containerResponse{Config: config})
+}
+
+// filterLabels keeps only the labels an operator asked for. With no allowlist
+// configured every label is relayed, which is what label selectors need and
+// what the proxy has always done; with one, a label added to a container
+// somewhere else cannot reach a client just because it exists.
+//
+// A nil map stays nil, so "Docker reported no labels" is still distinguishable
+// from "every label was filtered out".
+func (h *Handler) filterLabels(labels map[string]string) map[string]string {
+	if len(h.labelPrefixes) == 0 || labels == nil {
+		return labels
+	}
+
+	kept := make(map[string]string)
+
+	for key, value := range labels {
+		for _, prefix := range h.labelPrefixes {
+			if strings.HasPrefix(key, prefix) {
+				kept[key] = value
+				break
+			}
+		}
+	}
+
+	return kept
 }
 
 // imageInspect is both the subset decoded from Docker and the response body,

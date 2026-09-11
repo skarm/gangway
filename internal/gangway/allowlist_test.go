@@ -55,6 +55,9 @@ func TestDeniedRequestsNeverReachDocker(t *testing.T) {
 	paths := []string{
 		// Endpoints outside the allowlist.
 		"/v1.55/containers/create", "/v1.55/containers/json", "/version", "/info", "/events",
+		// Collection endpoints whose path is the inspect prefix and suffix with
+		// nothing in between; see TestCollectionEndpointsAreDenied.
+		"/v1.55/images/json", "/v1.55/networks/json", "/v1.55/volumes/json",
 		// Ping variants.
 		"/_ping?", "/_ping?x=1", "/v1.55/_ping", "/_ping/", "//_ping", "http://docker/_ping",
 		// Missing or malformed API versions.
@@ -131,6 +134,38 @@ func TestDeniedRequestsNeverReachDocker(t *testing.T) {
 
 	if got := calls.Load(); got != 0 {
 		t.Fatalf("denied requests reached Docker %d times", got)
+	}
+}
+
+// TestCollectionEndpointsAreDenied covers the Docker endpoints that list a
+// resource rather than inspect one. Their paths are the inspect prefix followed
+// directly by the inspect suffix, so a matcher that tests the suffix against the
+// whole path instead of the part after the prefix accepts them and forwards a
+// list request Docker answers with every image or container on the host.
+func TestCollectionEndpointsAreDenied(t *testing.T) {
+	for _, path := range []string{
+		"/v1.55/containers/json",
+		"/v1.55/images/json",
+		"/images/json",
+		"/v1.55/images/json/",
+	} {
+		t.Run(path, func(t *testing.T) {
+			if route, ok := gangway.Classify(httptest.NewRequest(http.MethodGet, path, nil)); ok {
+				t.Fatalf("collection endpoint accepted as %d: %q", route.Kind, path)
+			}
+		})
+	}
+	// The same path with a reference in it is an ordinary inspect and must
+	// still pass, including one whose reference happens to be "json".
+	for _, path := range []string{
+		"/v1.55/images/json/json",
+		"/v1.55/containers/" + testContainerID + "/json",
+	} {
+		t.Run("inspect "+path, func(t *testing.T) {
+			if _, ok := gangway.Classify(httptest.NewRequest(http.MethodGet, path, nil)); !ok {
+				t.Fatalf("inspect request rejected: %q", path)
+			}
+		})
 	}
 }
 

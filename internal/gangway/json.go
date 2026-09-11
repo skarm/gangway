@@ -77,6 +77,7 @@ type errorMessage struct {
 var (
 	bodyNotAllowed   = errorBody("request is not allowed")
 	bodyBusy         = errorBody("proxy is busy")
+	bodyRateLimited  = errorBody("docker API request rate exceeded")
 	bodyTimedOut     = errorBody("docker daemon request timed out")
 	bodyUnavailable  = errorBody("docker daemon is unavailable")
 	bodyInvalid      = errorBody("invalid response from docker daemon")

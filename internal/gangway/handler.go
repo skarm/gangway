@@ -26,10 +26,16 @@ type Handler struct {
 	client           *http.Client
 	transport        *http.Transport
 	maxResponseBytes int64
+	// labelPrefixes, when non-empty, is the allowlist container labels are
+	// filtered against before a response leaves the proxy.
+	labelPrefixes []string
 	// inFlight holds one token per request being forwarded to Docker, so
 	// len(inFlight) is the number of upstream requests in progress.
 	inFlight chan struct{}
-	log      *slog.Logger
+	// limiter bounds the rate of upstream requests, where inFlight bounds how
+	// many are open at once. Nil means no rate limit.
+	limiter *bucket
+	log     *slog.Logger
 }
 
 // NewHandler builds a Handler from cfg, applying defaults before validating.
@@ -59,6 +65,12 @@ func NewHandler(cfg Config) (*Handler, error) {
 		MaxResponseHeaderBytes: maxResponseHeaderBytes,
 	}
 
+	// The bucket holds burstSeconds of requests, but never fewer than the
+	// concurrency limit: a burst smaller than the number of requests that may be
+	// in flight would make the rate limit, not the concurrency limit, decide how
+	// much work the proxy can start, which is not what either flag says.
+	burst := max(float64(cfg.MaxRate)*burstSeconds, float64(cfg.MaxConcurrent))
+
 	return &Handler{
 		client: &http.Client{
 			Transport: transport,
@@ -69,7 +81,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 		},
 		transport:        transport,
 		maxResponseBytes: cfg.MaxResponseBytes,
+		labelPrefixes:    cfg.LabelPrefixes,
 		inFlight:         make(chan struct{}, cfg.MaxConcurrent),
+		limiter:          newBucket(float64(cfg.MaxRate), burst, time.Now()),
 		log:              cfg.Logger,
 	}, nil
 }
@@ -89,6 +103,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		h.logDenied(r)
 		writeError(w, http.StatusForbidden, bodyNotAllowed)
+		return
+	}
+
+	// Checked before a slot is taken: the rate limit is about the work Docker is
+	// asked to do, and a refused request should not have occupied capacity.
+	if !h.limiter.allow(time.Now()) {
+		h.logThrottled(r)
+		writeError(w, http.StatusTooManyRequests, bodyRateLimited)
 		return
 	}
 
@@ -124,6 +146,18 @@ func (h *Handler) logDenied(r *http.Request) {
 	}
 
 	h.log.DebugContext(ctx, "denied docker API request",
+		"method", r.Method, "path", pathForLog(r.URL.Path))
+}
+
+// logThrottled records a request refused by the rate limit. It is a debug record
+// for the same reason a rejection is: the client decides how often it happens.
+func (h *Handler) logThrottled(r *http.Request) {
+	ctx := r.Context()
+	if !h.log.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+
+	h.log.DebugContext(ctx, "throttled docker API request",
 		"method", r.Method, "path", pathForLog(r.URL.Path))
 }
 

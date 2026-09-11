@@ -103,8 +103,16 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) error {
 		return fmt.Errorf("listen: %w", err)
 	}
 
+	// Peer authorization sits directly on the socket, inside the connection
+	// limiter, so a client being turned away does not hold a connection slot
+	// that a permitted one needs.
+	authorized, err := AuthorizePeers(socket, opts.Peers, log)
+	if err != nil {
+		return errors.Join(fmt.Errorf("authorize socket peers: %w", err), socket.Close())
+	}
+
 	maxConnections := connectionsPerRequest * proxy.MaxConcurrent
-	listener := LimitConnections(socket, maxConnections)
+	listener := LimitConnections(authorized, maxConnections)
 	defer listener.Close()
 
 	shutdownTimeout := opts.ShutdownTimeout
@@ -122,8 +130,11 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) error {
 		"docker_socket", proxy.DockerSocket,
 		"max_concurrent", proxy.MaxConcurrent,
 		"max_connections", maxConnections,
+		"max_rate", proxy.MaxRate,
 		"upstream_timeout", proxy.UpstreamTimeout.String(),
 		"worst_case_memory_bytes", proxy.WorstCaseMemoryBytes(),
+		"peer_policy", opts.Peers.String(),
+		"label_prefixes", len(proxy.LabelPrefixes),
 	)
 	warnOnMemoryLimit(log, proxy)
 

@@ -135,6 +135,27 @@ func jsonLogger(w io.Writer) *slog.Logger {
 	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
+// levelLogger writes JSON records into w at and above level, for tests that
+// assert which records a given --log-level does and does not produce.
+func levelLogger(w io.Writer, level int) *slog.Logger {
+	return slog.New(slog.NewJSONHandler(w, &slog.HandlerOptions{Level: slog.Level(level)}))
+}
+
+// startListener returns a Unix listener for tests that only need a net.Listener
+// to wrap.
+func startListener(t *testing.T) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("unix", filepath.Join(socketDir(t), "test.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+// discardOutput is where tests send usage text they do not assert on.
+func discardOutput() io.Writer { return io.Discard }
+
 // timeAfterAwait is the shared deadline for selects that wait on a value.
 func timeAfterAwait() <-chan time.Time { return time.After(awaitTimeout) }
 

@@ -2,6 +2,7 @@ package gangway
 
 import (
 	"io"
+	"net"
 	"net/http"
 )
 
@@ -38,3 +39,22 @@ func (h *Handler) Transport() *http.Transport { return h.transport }
 
 // HasLogger reports whether a logger was resolved during construction.
 func (h *Handler) HasLogger() bool { return h.log != nil }
+
+// PeerCredentialsSupported reports whether this platform can identify the
+// process behind a Unix socket connection.
+func PeerCredentialsSupported() bool { return supportPeerCredentials() == nil }
+
+// PeerCredentialsOf exposes the kernel's view of a connection's peer.
+func PeerCredentialsOf(conn net.Conn) (pid int32, uid, gid uint32, err error) {
+	cred, err := peerCredentialsOf(conn)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return cred.pid, cred.uid, cred.gid, nil
+}
+
+// AllowsPeer exposes the policy decision, so the rule can be tested without a
+// socket and on platforms that have no SO_PEERCRED.
+func (p PeerPolicy) AllowsPeer(uid, gid, self uint32) bool {
+	return p.allows(peerCredentials{uid: uid, gid: gid}, self)
+}
