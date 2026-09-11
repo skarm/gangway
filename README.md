@@ -106,6 +106,90 @@ Out-of-range values exit with status 2 without touching either socket. On
 `SIGTERM`/`SIGINT` the service stops accepting connections and drains within the
 shutdown timeout; the service manager's stop timeout must exceed it.
 
+## Deployment options
+
+Where the SPIRE agent runs, and whether it goes through this proxy, decide what
+the proxy is worth. Two questions settle it before any configuration matters:
+
+1. **Is the daemon rootful?** For a rootless daemon the socket is not
+   root-equivalent, and none of this is needed — give the agent the real socket.
+2. **Is the agent root?** A root agent opens `/var/run/docker.sock` whatever you
+   configure, so a proxy in front of it changes nothing.
+
+This proxy is for one case: an agent that is **not** root and needs
+`docker:label` or `docker:image` selectors. The rest of this section is here so
+you can tell whether that is the case you have.
+
+| Agent runs | Docker access | What a compromised agent gets |
+| --- | --- | --- |
+| Host, root | real socket | host root — it already had it |
+| Host, root | this proxy | host root; the proxy changes nothing |
+| Host, unprivileged, group `docker` | real socket | **host root** |
+| Host, unprivileged | this proxy | container labels and images |
+| Container, `pid: host`, root | real socket mounted in | host root |
+| Container, `pid: host`, unprivileged | this proxy's socket mounted in | container labels and images |
+
+In every row the agent can also issue an SVID for any workload registered
+against that node: it performs attestation itself, so a compromised agent means
+compromised identities on that node regardless. This proxy bounds escalation to
+host root, not the damage inside the trust domain. Nothing here substitutes for
+protecting the agent.
+
+The agent must run in the **host PID namespace** in every row. It reads the
+caller's PID from the connection, then resolves it to a container through
+`/proc/<pid>/cgroup`; a PID from any other namespace resolves to the wrong
+process or to none. For a containerized agent that means `pid: host`.
+
+### Agent on the host, no proxy
+
+Simplest, and correct if you have decided the agent is a trusted component of
+that machine. As root it reads any `/proc/<pid>` and reaches Docker directly.
+
+What does **not** work here is making a non-root agent safe by giving it the
+socket some other way. Membership in group `docker` is root-equivalent; so is an
+ACL on the socket file (`setfacl -m u:spire-agent:rw`), which grants one user
+instead of a group but the same full API. A read-only bind mount does not make
+the API read-only either. Docker's authorization plugins identify a client by
+its TLS certificate, which a Unix socket connection does not present, so they
+cannot express "this local client may only inspect" — a second TLS listener with
+client certificates can, at considerably more cost than this proxy.
+
+A root agent has one option a non-root agent does not: **drop the Docker
+attestor entirely.** Under root the `unix` attestor reads `/proc/<pid>/exe`,
+which resolves inside the container's mount namespace, so `unix:sha256` and
+`unix:path` identify the workload's real binary with no Docker socket in the
+picture at all. That beats both direct access and this proxy. The cost is that
+one image is one hash: two containers from the same image are
+indistinguishable, and every rebuild changes the selector. Worth it when the
+workloads are few and stable.
+
+### Agent on the host, behind the proxy
+
+The case this proxy exists for. The agent runs as its own unprivileged user and
+belongs to no privileged group; `gangway` is the only account in group `docker`.
+A compromised agent can then read container labels and image references and
+nothing else. See [Run on the host](#run-on-the-host).
+
+The cost is the `unix:sha256` and `unix:path` selectors: reading
+`/proc/<pid>/exe` needs root or the workload's own UID. `unix:uid`, `unix:gid`
+and every `docker:` selector still work, because `/proc/<pid>/cgroup` is
+world-readable — unless `/proc` is mounted with `hidepid`, which breaks the
+Docker attestor for a non-root agent outright. Check that first.
+
+### Agent in a container, no proxy
+
+Needs `pid: host` like every other row, plus the real socket mounted in. The
+container then holds a root-equivalent socket, so its `cap_drop`, `read_only`
+and user settings decorate a process that can start a privileged container
+whenever it likes. This is the configuration that looks hardened and is not.
+
+### Agent in a container, behind the proxy
+
+What [Run with Docker Compose](#run-with-docker-compose) sets up: the proxy
+holds the real socket in one container, and the agent gets a socket that answers
+the three endpoints at the top of this file. Mount the proxy's socket **directory** into the agent, give the
+agent `pid: host`, and keep the real socket out of it.
+
 ## Run with Docker Compose
 
 ```sh
@@ -137,16 +221,111 @@ a separate SPIRE UID, use `--socket-mode=0660` and give SPIRE GID 1000; only
 trusted clients should belong to that group. Add `--allow-uid=<spire-uid>` once
 you know it — with the containers sharing the host's user namespace, that is the
 UID the SPIRE container runs as — so that widening the mode later does not widen
-who may connect. The socket's directory has to let
-that group through as well: the proxy creates one as `0750` whatever the umask
-says, and refuses to serve a `0660` socket from a directory prepared without
-group access, rather than running where no client can reach it.
+who may connect. The socket's directory has to let that group through as well:
+the proxy creates one as `0750` whatever the umask says, and refuses to serve a
+`0660` socket from a directory prepared without group access, rather than
+running where no client can reach it.
+
+## Run on the host
+
+Two accounts, neither of which is root: `gangway` is the only member of group
+`docker`, and the agent reaches the proxy through a group they share.
+
+```sh
+sudo groupadd --system spire
+sudo useradd --system --gid spire --no-create-home --shell /usr/sbin/nologin gangway
+sudo useradd --system --gid spire --no-create-home --shell /usr/sbin/nologin spire-agent
+sudo usermod --append --groups docker gangway
+```
+
+`Group=spire` below is the proxy's *primary* group, so the socket it creates
+belongs to `spire` and the agent can open it at mode `0660`. `--allow-uid` then
+pins it to the agent's UID, so widening the mode later does not widen who may
+connect; the proxy's own user is always allowed, which is what keeps
+`--healthcheck` working.
+
+```ini
+# /etc/systemd/system/gangway.service
+[Unit]
+Description=Docker API proxy for the SPIRE agent
+Wants=docker.service
+After=docker.service
+
+[Service]
+User=gangway
+Group=spire
+SupplementaryGroups=docker
+RuntimeDirectory=gangway
+RuntimeDirectoryMode=0750
+Environment=GOMEMLIMIT=448MiB
+ExecStart=/usr/local/bin/gangway \
+    --listen-socket=/run/gangway/docker.sock \
+    --docker-socket=/var/run/docker.sock \
+    --socket-mode=0660 \
+    --allow-uid=SPIRE_AGENT_UID
+Restart=always
+RestartPreventExitStatus=2
+TimeoutStopSec=70
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateNetwork=yes
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=1024
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`RuntimeDirectory=gangway` creates `/run/gangway` as `gangway:spire` mode
+`0750`, which is what the proxy requires: owned by its own user, not writable by
+group or others, and traversable by the group the `0660` socket is for. It is
+removed on stop, taking the socket and lock file with it.
+
+The rest mirrors the Compose file. `PrivateNetwork=yes` is the equivalent of
+`network_mode: none` and costs nothing, because the proxy speaks only to Unix
+sockets; `ProtectSystem=strict` still permits connecting to one, since a
+read-only mount blocks writes to files and directories but not to sockets.
+`MemoryMax`, `GOMEMLIMIT`, `TasksMax` and `LimitNOFILE` are sized for the
+default response and concurrency limits — raise them along with those flags,
+never the flags alone — and `TimeoutStopSec` must exceed the shutdown timeout.
+`RestartPreventExitStatus=2` is what stops a misconfiguration from becoming a
+restart loop: the proxy exits 2 for a usage error and 1 for a runtime failure.
+
+`Wants=`, not `Requires=`, in both directions. The proxy answers 502 while the
+daemon is away and recovers on its own, so it need not be torn down with a
+Docker restart, and the agent has no reason to stop when the proxy does.
+
+The agent's unit needs `Wants=gangway.service` and `After=gangway.service`, or
+its first attestations arrive before the socket exists. Two things about its own
+Workload API socket are worth setting deliberately:
+
+- Put it under `/run`, not the default below `/tmp`. Any unit with
+  `PrivateTmp=yes` gets a private `/tmp`, and a socket there is invisible to
+  every workload — a failure that looks like the agent never started.
+- Workloads reach it by opening that socket, so the path must be readable from
+  wherever they run. For containerized workloads, bind-mount the **directory**
+  into each container and point `SPIFFE_ENDPOINT_SOCKET` at it; mounting the
+  socket file pins an inode the agent replaces on restart. SPIRE's boundary at
+  that socket is attestation, not file permissions — check the mode your version
+  creates rather than assuming it restricts anything.
+
+```hcl
+agent {
+    data_dir     = "/var/lib/spire/agent"
+    socket_path  = "/run/spire/agent/api.sock"
+    trust_domain = "example.org"
+}
+```
 
 ## Connect SPIRE
 
-Mount the output **directory** into the SPIRE container at `/run/gangway`
-read-only (`proxy-socket:/run/gangway:ro` in the same Compose project, with
-`depends_on: {gangway: {condition: service_healthy}}`).
+Point the Docker attestor at the proxy's socket instead of Docker's. On the
+host that is the `--listen-socket` path directly:
 
 ```hcl
 WorkloadAttestor "docker" {
@@ -155,6 +334,13 @@ WorkloadAttestor "docker" {
     }
 }
 ```
+
+For a containerized agent, mount the proxy's socket **directory** — not the
+socket file, which pins an inode the proxy replaces on restart — read-only into
+the agent (`proxy-socket:/run/gangway:ro` in the same Compose project, with
+`depends_on: {gangway: {condition: service_healthy}}`), and use the same path
+inside it. That agent also needs `pid: host`, as every deployment does; see
+[Deployment options](#deployment-options).
 
 Leave `docker_version` unset to negotiate the API version. Labels, image
 references, and image digests are preserved, so label selectors work;
@@ -181,13 +367,13 @@ have. Read this section before deploying it.
   to reaching that point and bound nothing after it. What actually keeps the bar
   high is the size of the attack surface: no dependencies, no cgo, a memory-safe
   language, and a parser surface that is `net/http` and `encoding/json` rather
-  than this code. Keep `govulncheck` in CI — it is the control that matters most.
-- **The gain is the blast radius of a compromised client, not of the proxy.** A
-  SPIRE agent that already runs as root on the host, with host PID namespace,
-  for its process and cgroup attestors gains almost nothing from having the
-  Docker socket taken away, and this proxy buys little there. It pays off when
-  the agent is containerized and unprivileged, which the Compose setup above
-  assumes. Check which one you are actually deploying.
+  than this code. Keep `govulncheck` in CI — it is the control that matters
+  most.
+- **The gain is the blast radius of a compromised client, not of the proxy.** An
+  agent that is already root gains nothing from having the Docker socket taken
+  away, and a compromised agent can issue every SVID on its node either way.
+  [Deployment options](#deployment-options) has the cases side by side; read it
+  before assuming this proxy is buying you something.
 - The single largest improvement available is outside this code: run a
   **rootless** Docker daemon, and the socket stops being root-equivalent at all.
 - Socket permissions decide which local clients may use the proxy, and
