@@ -20,6 +20,12 @@ const (
 	upstreamIdleTimeout    = 30 * time.Second
 )
 
+// upstreamWarnInterval is the shortest gap between warnings about Docker
+// answering with a server error. How often the daemon fails is worth seeing at
+// the default log level; how often a client asks about it is not, and without
+// a limit the two are the same number.
+const upstreamWarnInterval = 30 * time.Second
+
 // Handler serves the allowed Docker API surface. It is safe for concurrent use
 // and owns the single upstream connection pool.
 type Handler struct {
@@ -35,7 +41,11 @@ type Handler struct {
 	// limiter bounds the rate of upstream requests, where inFlight bounds how
 	// many are open at once. Nil means no rate limit.
 	limiter *bucket
-	log     *slog.Logger
+	// upstreamWarn bounds how often a Docker server error is written down. It
+	// is a bucket of one token so the first failure is reported at once, and a
+	// client retrying into a broken daemon cannot set the pace of the log.
+	upstreamWarn *bucket
+	log          *slog.Logger
 }
 
 // NewHandler builds a Handler from cfg, applying defaults before validating.
@@ -84,6 +94,7 @@ func NewHandler(cfg Config) (*Handler, error) {
 		labelPrefixes:    cfg.LabelPrefixes,
 		inFlight:         make(chan struct{}, cfg.MaxConcurrent),
 		limiter:          newBucket(float64(cfg.MaxRate), burst, time.Now()),
+		upstreamWarn:     newBucket(1/upstreamWarnInterval.Seconds(), 1, time.Now()),
 		log:              cfg.Logger,
 	}, nil
 }
@@ -106,19 +117,24 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Checked before a slot is taken: the rate limit is about the work Docker is
-	// asked to do, and a refused request should not have occupied capacity.
-	if !h.limiter.allow(time.Now()) {
-		h.logThrottled(r)
-		writeError(w, http.StatusTooManyRequests, bodyRateLimited)
-		return
-	}
-
+	// The slot is taken first and given straight back if the rate limit refuses
+	// the request. Both limits exist to bound the work Docker is asked to do, so
+	// neither may be spent on a request that never reaches it: checking the rate
+	// first would let a client that is already being answered with 503 drain the
+	// token budget, and turn a moment of saturation into a refusal that outlives
+	// it. A slot is the cheaper of the two to hold, because it is released on
+	// this same call and not over time.
 	if !h.acquire() {
 		writeError(w, http.StatusServiceUnavailable, bodyBusy)
 		return
 	}
 	defer h.release()
+
+	if !h.limiter.allow(time.Now()) {
+		h.logThrottled(r)
+		writeError(w, http.StatusTooManyRequests, bodyRateLimited)
+		return
+	}
 
 	switch route.Kind {
 	case RoutePing:

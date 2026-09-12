@@ -106,6 +106,17 @@ func TestLabelPrefixesRestrictWhatLeavesTheProxy(t *testing.T) {
 			prefixes: []string{"absent."},
 			want:     map[string]string{},
 		},
+		// The filter edits the decoded map in place, so an allowlist covering
+		// everything has to delete nothing at all rather than nearly nothing.
+		"prefixes covering every label": {
+			prefixes: []string{"spiffe.io/", "com.example/", "secret.internal/", "org.opencontainers."},
+			want: map[string]string{
+				"spiffe.io/team":                  "payments",
+				"com.example/tier":                "web",
+				"secret.internal/token":           "must-not-be-relayed",
+				"org.opencontainers.image.source": "https://example.invalid",
+			},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			socket := startDocker(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -142,6 +153,42 @@ func TestLabelPrefixesRestrictWhatLeavesTheProxy(t *testing.T) {
 			}
 			if strings.Contains(rr.Body.String(), "hidden") {
 				t.Errorf("environment reached the client: %s", rr.Body.String())
+			}
+		})
+	}
+}
+
+// TestLabelFilteringKeepsAbsentLabelsAbsent holds the one distinction the
+// filter must not erase: a container Docker reports no labels for is not a
+// container whose labels were all filtered away. A client reading the first as
+// the second would conclude the proxy dropped something.
+func TestLabelFilteringKeepsAbsentLabelsAbsent(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want string
+	}{
+		"no Labels field at all": {body: `{"Config":{"Image":"app:v1"}}`, want: `"Labels":null`},
+		"an explicit null":       {body: `{"Config":{"Image":"app:v1","Labels":null}}`, want: `"Labels":null`},
+		"an empty object":        {body: `{"Config":{"Image":"app:v1","Labels":{}}}`, want: `"Labels":{}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			socket := startDocker(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			h := newHandlerWithConfig(t, gangway.Config{
+				DockerSocket:    socket,
+				UpstreamTimeout: time.Second,
+				LabelPrefixes:   []string{"spiffe.io/"},
+			})
+
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1.55/containers/"+testContainerID+"/json", nil))
+
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status = %d: %s", rr.Code, rr.Body.String())
+			}
+			if !strings.Contains(rr.Body.String(), tc.want) {
+				t.Errorf("body = %s, want it to contain %s", strings.TrimSpace(rr.Body.String()), tc.want)
 			}
 		})
 	}

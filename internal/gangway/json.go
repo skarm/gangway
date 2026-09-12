@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -43,18 +44,38 @@ func putBuffer(buf *bytes.Buffer) {
 // ErrResponseTooLarge reports that Docker sent more than the configured limit.
 var ErrResponseTooLarge = errors.New("docker response exceeds configured limit")
 
+// ErrUpstreamRead reports that the response body ended or failed before it was
+// read to the end. It separates a daemon that went away mid-response from a
+// response this proxy could not parse, which are the same error to a decoder
+// and different faults to an operator.
+var ErrUpstreamRead = errors.New("docker response could not be read")
+
 // decodeJSON decodes exactly one JSON value from at most maxBytes of r. Reading
 // past the limit is an error rather than a truncation, so an oversized response
 // can never be accepted as a shorter valid one.
-func decodeJSON(r io.Reader, maxBytes int64, dst any) error {
+//
+// hint is the length the response declared, or a non-positive number when it
+// declared none. It sizes the read buffer and decides nothing else: a response
+// over the limit is refused whatever it claimed, so the hint is ignored past
+// that point, and a declared length that lies about being large costs no more
+// than a response at the limit — which is what the process is sized for anyway.
+func decodeJSON(r io.Reader, maxBytes, hint int64, dst any) error {
 	buf := getBuffer()
 	defer putBuffer(buf)
+
+	// Without this, ReadFrom doubles its way up to the response size, copying
+	// everything it has read at every step: a megabyte arrives through eleven
+	// allocations and a megabyte of copying, for a length the daemon already
+	// declared. Grow is a no-op when the pooled buffer is big enough already.
+	if hint > 0 && hint <= maxBytes {
+		buf.Grow(int(hint))
+	}
 
 	// One byte past the limit separates a response at the limit from one over
 	// it without reading any more of an oversized body than that.
 	read, err := buf.ReadFrom(io.LimitReader(r, maxBytes+1))
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrUpstreamRead, err)
 	}
 
 	if read > maxBytes {
@@ -82,6 +103,7 @@ var (
 	bodyUnavailable  = errorBody("docker daemon is unavailable")
 	bodyInvalid      = errorBody("invalid response from docker daemon")
 	bodyUpstreamFail = errorBody("docker API request failed")
+	bodyInternal     = errorBody("proxy failed to encode the response")
 )
 
 func errorBody(message string) []byte {
@@ -112,9 +134,12 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	defer putBuffer(buf)
 
 	if err := encodeJSON(buf, value); err != nil {
-		// Nothing has reached the client yet, so the status can still report
-		// that the response could not be produced.
-		w.WriteHeader(http.StatusInternalServerError)
+		// Encode marshals the whole value before it writes any of it, so a
+		// failure here has put nothing in buf and nothing on the wire: the
+		// status can still report that the response could not be produced, and
+		// it carries the same body shape as every other failure rather than
+		// being the one answer a client cannot parse the same way.
+		writeError(w, http.StatusInternalServerError, bodyInternal)
 		return
 	}
 

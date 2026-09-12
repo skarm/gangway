@@ -7,6 +7,7 @@ import (
 	"flag"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -100,6 +101,83 @@ func TestMainExitCodes(t *testing.T) {
 	unavailable := []string{"--healthcheck", "--listen-socket=" + filepath.Join(socketDir(t), "absent.sock")}
 	if got := gangway.Main(unavailable, io.Discard, io.Discard); got != 1 {
 		t.Fatalf("unavailable healthcheck exit = %d, want 1", got)
+	}
+}
+
+// TestMainExitsTwoForEveryConfigurationMistake holds the exit codes to what the
+// README promises a service manager, which is the whole point of having two of
+// them: RestartPreventExitStatus=2 stops a misconfigured proxy rather than
+// restarting it into the same refusal until the start limit runs out. Half of
+// these are only decided once the filesystem has been read, well past the point
+// where the command line has had its say, so asserting that Run returns *an*
+// error would not tell an operator which of the two codes they get.
+func TestMainExitsTwoForEveryConfigurationMistake(t *testing.T) {
+	dir := socketDir(t)
+	dockerSocket := filepath.Join(dir, "docker.sock")
+	listener, err := net.Listen("unix", dockerSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	// A name that resolves onto the Docker socket only once the link in it has
+	// been expanded, which is the aliasing ValidatePaths exists for.
+	alias := filepath.Join(dir, "alias.sock")
+	if err := os.Symlink(dockerSocket, alias); err != nil {
+		t.Fatal(err)
+	}
+
+	regularFile := filepath.Join(dir, "not-a-socket")
+	if err := os.WriteFile(regularFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	listen := "--listen-socket=" + filepath.Join(dir, "gangway.sock")
+
+	// Every case below has to be refused before the proxy starts serving. One
+	// that is not would block until the whole test binary timed out, which is a
+	// failure nobody can read, so Main is given a deadline of its own.
+	mainExit := func(t *testing.T, args []string) int {
+		t.Helper()
+
+		exit := make(chan int, 1)
+		go func() { exit <- gangway.Main(args, io.Discard, io.Discard) }()
+
+		select {
+		case code := <-exit:
+			return code
+		case <-timeAfterAwait():
+			t.Fatal("Main never returned: the configuration was accepted and the proxy is serving")
+			return 0
+		}
+	}
+
+	for name, args := range map[string][]string{
+		"a relative listen socket":     {"--listen-socket=gangway.sock"},
+		"a relative docker socket":     {"--docker-socket=docker.sock"},
+		"one path spelled for both":    {"--listen-socket=" + dockerSocket, "--docker-socket=" + dockerSocket},
+		"an unclean listen socket":     {"--listen-socket=" + dir + "/./gangway.sock", "--docker-socket=" + dockerSocket},
+		"a listen socket aliasing it":  {"--listen-socket=" + alias, "--docker-socket=" + dockerSocket},
+		"a docker socket that is not":  {listen, "--docker-socket=" + regularFile},
+		"a limit outside its range":    {listen, "--max-concurrent=0"},
+		"an unparseable socket mode":   {listen, "--socket-mode=0777"},
+		"an empty label prefix":        {listen, "--label-prefix=a,,b"},
+		"a shutdown timeout too short": {listen, "--shutdown-timeout=1ms"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := mainExit(t, args); got != 2 {
+				t.Errorf("exit = %d, want 2, for %v", got, args)
+			}
+		})
+	}
+
+	// The other side of the contract: a path that is spelled correctly and
+	// fails on what the filesystem happens to hold is an outage rather than a
+	// mistake, and a supervisor has to keep restarting it. Here the socket
+	// directory is a regular file, which the next start may well find fixed.
+	unusable := []string{"--listen-socket=" + filepath.Join(regularFile, "gangway.sock"), "--docker-socket=" + dockerSocket}
+	if got := mainExit(t, unusable); got != 1 {
+		t.Errorf("exit = %d for a socket directory that is a regular file, want 1", got)
 	}
 }
 

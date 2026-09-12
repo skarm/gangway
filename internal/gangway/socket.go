@@ -56,9 +56,14 @@ func (l *unixListener) Close() error {
 // alongside another instance or to disturb a file it did not create. mode must
 // be 0600 or 0660; anything wider would hand out the Docker API more freely
 // than the proxy's own access to it.
+//
+// The three checks below decide the path and the mode as written, so they are
+// ConfigErrors and exit 2. Everything after them — the directory, the lock, the
+// bind — depends on what is on disk at the time and stays a runtime failure a
+// supervisor should retry.
 func Listen(path string, mode os.FileMode) (net.Listener, error) {
 	if !filepath.IsAbs(path) {
-		return nil, errors.New("listen socket path must be absolute")
+		return nil, configErrorf("listen socket path must be absolute")
 	}
 	// Everything below reads the socket's directory and lock name off this
 	// path with filepath.Dir and a suffix, which resolve ".." lexically while
@@ -66,11 +71,11 @@ func Listen(path string, mode os.FileMode) (net.Listener, error) {
 	// path keeps the two from naming different directories, rather than
 	// checking one and binding in the other.
 	if filepath.Clean(path) != path {
-		return nil, fmt.Errorf(`listen socket path must be clean, without "..", "." or repeated separators: %q`, path)
+		return nil, configErrorf(`listen socket path must be clean, without "..", "." or repeated separators: %q`, path)
 	}
 
 	if mode != 0o600 && mode != 0o660 {
-		return nil, errors.New("socket permissions must be 0600 or 0660")
+		return nil, configErrorf("socket permissions must be 0600 or 0660")
 	}
 
 	dir := filepath.Dir(path)

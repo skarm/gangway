@@ -105,6 +105,15 @@ type authorizedListener struct {
 // this platform is an error rather than a warning: a check configured and
 // silently skipped is worse than no check at all.
 func AuthorizePeers(listener net.Listener, policy PeerPolicy, log *slog.Logger) (net.Listener, error) {
+	return authorizePeers(listener, policy, uint32(os.Geteuid()), log)
+}
+
+// authorizePeers is AuthorizePeers with the exempt user given rather than read
+// from the process, so a test can exercise the rejection path as a client the
+// exemption does not cover. A test process can only connect as itself, and
+// without this the one connection it can make is the one the policy never
+// refuses.
+func authorizePeers(listener net.Listener, policy PeerPolicy, self uint32, log *slog.Logger) (net.Listener, error) {
 	if policy.Empty() {
 		return listener, nil
 	}
@@ -120,7 +129,7 @@ func AuthorizePeers(listener net.Listener, policy PeerPolicy, log *slog.Logger) 
 	return &authorizedListener{
 		Listener: listener,
 		policy:   policy,
-		self:     uint32(os.Geteuid()),
+		self:     self,
 		log:      log,
 	}, nil
 }

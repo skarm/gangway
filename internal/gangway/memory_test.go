@@ -2,6 +2,7 @@ package gangway
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
 	"math"
 	"runtime"
@@ -34,14 +35,19 @@ func labelKey(i int) string {
 // is the shortest distinct key with an empty value, so each byte of body buys
 // as much map as it can. A single large label value, or a response padded with
 // fields the proxy drops, costs a fraction of this.
-func denseLabelsBody(size int) []byte {
+//
+// keyPrefix goes in front of every key, which is what lets a case configure a
+// label allowlist that keeps all of them or none. It makes each key one byte
+// longer and so the body very slightly less dense, which is why the rows
+// measuring the decoder itself leave it empty.
+func denseLabelsBody(size int, keyPrefix string) []byte {
 	const open, tail = `{"Config":{"Image":"i","Labels":{`, `}}}`
 
 	body := make([]byte, 0, size)
 	body = append(body, open...)
 
 	for i := 0; ; i++ {
-		entry := `"` + labelKey(i) + `":""`
+		entry := `"` + keyPrefix + labelKey(i) + `":""`
 		if i > 0 {
 			entry = "," + entry
 		}
@@ -75,78 +81,122 @@ func liveHeap() int64 {
 // concurrently and all of them are kept alive together, because what the
 // process has to fit is their sum and not the largest of them.
 //
-// Each case carries the same total of upstream JSON, so the rows differ only in
-// how that total is split between response size and concurrency. The 1 MiB row
-// is the shipped configuration.
+// What a slot holds is measured across the whole path a response takes, not
+// only its ends: the bytes read from Docker, the map they decoded to, the label
+// filter applied to that map, and the response encoded beside it. The filter is
+// on this path because it is the one step that could hold a second copy of the
+// most expensive object in the process, and a bound measured without it would
+// be a bound on a different program.
+//
+// The first rows carry the same total of upstream JSON and differ only in how
+// it is split between response size and concurrency; the 1 MiB row is the
+// shipped configuration. The last two add an allowlist at the size where the
+// cost per byte peaks, keeping every label and then none of them.
 func TestWorstCaseMemoryBoundsASaturatedProxy(t *testing.T) {
 	for _, tc := range []struct {
+		name             string
 		maxResponseBytes int64
 		maxConcurrent    int
+		keyPrefix        string
+		labelPrefixes    []string
 	}{
-		{maxResponseBytes: 4 << 10, maxConcurrent: 2048},
+		{name: "4 KiB x 2048", maxResponseBytes: 4 << 10, maxConcurrent: 2048},
 		// Where the cost per byte peaks, so the row with the least margin
 		// against the factor is the one that runs.
-		{maxResponseBytes: 16 << 10, maxConcurrent: 512},
-		{maxResponseBytes: 64 << 10, maxConcurrent: 128},
-		{maxResponseBytes: DefaultMaxResponseBytes, maxConcurrent: DefaultMaxConcurrent},
-		{maxResponseBytes: 4 << 20, maxConcurrent: 2},
+		{name: "16 KiB x 512", maxResponseBytes: 16 << 10, maxConcurrent: 512},
+		{name: "64 KiB x 128", maxResponseBytes: 64 << 10, maxConcurrent: 128},
+		{name: "the defaults", maxResponseBytes: DefaultMaxResponseBytes, maxConcurrent: DefaultMaxConcurrent},
+		{name: "4 MiB x 2", maxResponseBytes: 4 << 20, maxConcurrent: 2},
+		{
+			name: "16 KiB x 512 keeping every label", maxResponseBytes: 16 << 10, maxConcurrent: 512,
+			keyPrefix: "z", labelPrefixes: []string{"z"},
+		},
+		{
+			name: "16 KiB x 512 keeping no label", maxResponseBytes: 16 << 10, maxConcurrent: 512,
+			keyPrefix: "z", labelPrefixes: []string{"q"},
+		},
 	} {
-		cfg := Config{
-			DockerSocket:     "/unused.sock",
-			MaxResponseBytes: tc.maxResponseBytes,
-			MaxConcurrent:    tc.maxConcurrent,
-		}.WithDefaults()
-		if err := cfg.Validate(); err != nil {
-			t.Fatal(err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{
+				DockerSocket:     "/unused.sock",
+				MaxResponseBytes: tc.maxResponseBytes,
+				MaxConcurrent:    tc.maxConcurrent,
+				LabelPrefixes:    tc.labelPrefixes,
+				Logger:           slog.New(slog.NewJSONHandler(io.Discard, nil)),
+			}.WithDefaults()
 
-		body := denseLabelsBody(int(cfg.MaxResponseBytes))
-		if int64(len(body)) > cfg.MaxResponseBytes {
-			t.Fatalf("test body of %d bytes exceeds the limit it was built for", len(body))
-		}
+			h, err := NewHandler(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer h.Close()
 
-		base := liveHeap()
+			body := denseLabelsBody(int(cfg.MaxResponseBytes), tc.keyPrefix)
+			if int64(len(body)) > cfg.MaxResponseBytes {
+				t.Fatalf("test body of %d bytes exceeds the limit it was built for", len(body))
+			}
 
-		// One slot's worth of state each: what the response decoded to, and the
-		// response the proxy encoded from it.
-		decoded := make([]containerInspect, cfg.MaxConcurrent)
-		encoded := make([]*bytes.Buffer, cfg.MaxConcurrent)
+			base := liveHeap()
 
-		var slots sync.WaitGroup
-		for i := range decoded {
-			slots.Go(func() {
-				if err := decodeJSON(bytes.NewReader(body), cfg.MaxResponseBytes, &decoded[i]); err != nil {
-					t.Error(err)
-					return
-				}
+			// One slot's worth of state each: the bytes read off the socket,
+			// what they decoded to, and the response encoded from it.
+			raw := make([][]byte, cfg.MaxConcurrent)
+			decoded := make([]containerInspect, cfg.MaxConcurrent)
+			filtered := make([]containerConfig, cfg.MaxConcurrent)
+			encoded := make([]*bytes.Buffer, cfg.MaxConcurrent)
 
-				buf := getBuffer()
-				if err := encodeJSON(buf, containerResponse{Config: *decoded[i].Config}); err != nil {
-					t.Error(err)
-					return
-				}
+			var slots sync.WaitGroup
+			for i := range decoded {
+				slots.Go(func() {
+					// A private copy, because every slot reads its own response
+					// off its own connection and no two share the bytes.
+					raw[i] = append([]byte(nil), body...)
 
-				encoded[i] = buf
-			})
-		}
-		slots.Wait()
-		if t.Failed() {
-			return
-		}
+					if err := decodeJSON(bytes.NewReader(raw[i]), cfg.MaxResponseBytes, int64(len(raw[i])), &decoded[i]); err != nil {
+						t.Error(err)
+						return
+					}
 
-		peak := liveHeap() - base
-		runtime.KeepAlive(decoded)
-		runtime.KeepAlive(encoded)
+					config := *decoded[i].Config
+					config.Labels = h.filterLabels(config.Labels)
+					// Both the decoded response and the filtered one are held,
+					// because in the handler both are reachable while the reply
+					// is encoded: the decoded value is a live local until the
+					// request returns. A filter that builds a second map is a
+					// second copy of the most expensive object in the process,
+					// and this is the moment at which it exists.
+					filtered[i] = config
 
-		budget := cfg.WorstCaseMemoryBytes()
-		t.Logf("%d x %d B: %d bytes live, %d budgeted (x%.1f of the JSON, factor %d)",
-			cfg.MaxConcurrent, cfg.MaxResponseBytes, peak, budget,
-			float64(peak)/float64(int64(cfg.MaxConcurrent)*cfg.MaxResponseBytes), responseMemoryFactor)
+					buf := getBuffer()
+					if err := encodeJSON(buf, containerResponse{Config: config}); err != nil {
+						t.Error(err)
+						return
+					}
 
-		if peak > budget {
-			t.Errorf("%d requests of %d bytes hold %d bytes of live heap, over the %d bytes WorstCaseMemoryBytes promises",
-				cfg.MaxConcurrent, cfg.MaxResponseBytes, peak, budget)
-		}
+					encoded[i] = buf
+				})
+			}
+			slots.Wait()
+			if t.Failed() {
+				return
+			}
+
+			peak := liveHeap() - base
+			runtime.KeepAlive(raw)
+			runtime.KeepAlive(decoded)
+			runtime.KeepAlive(filtered)
+			runtime.KeepAlive(encoded)
+
+			budget := cfg.WorstCaseMemoryBytes()
+			t.Logf("%d x %d B: %d bytes live, %d budgeted (x%.1f of the JSON, factor %d)",
+				cfg.MaxConcurrent, cfg.MaxResponseBytes, peak, budget,
+				float64(peak)/float64(int64(cfg.MaxConcurrent)*cfg.MaxResponseBytes), responseMemoryFactor)
+
+			if peak > budget {
+				t.Errorf("%d requests of %d bytes hold %d bytes of live heap, over the %d bytes WorstCaseMemoryBytes promises",
+					cfg.MaxConcurrent, cfg.MaxResponseBytes, peak, budget)
+			}
+		})
 	}
 }
 

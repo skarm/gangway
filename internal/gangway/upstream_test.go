@@ -94,6 +94,73 @@ func TestDockerErrorStatusIsNotAProxyFault(t *testing.T) {
 	}
 }
 
+// TestDockerServerErrorsAreWarnings separates the daemon failing from the
+// daemon answering. A 404 is an answer about the container that was asked for
+// and stays a debug record; a 5xx is the daemon reporting that it could not
+// serve the request, which means attestation is failing for a reason nothing
+// else in this proxy will show. It is the client that decides how often either
+// happens, so the warning is rate limited and the records that the limit drops
+// are still there at debug.
+func TestDockerServerErrorsAreWarnings(t *testing.T) {
+	const requests = 20
+
+	status := http.StatusServiceUnavailable
+	socket := startDocker(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, `{"message":"daemon is shutting down"}`)
+	}))
+
+	var atInfo, atDebug strings.Builder
+	newHandlerFor := func(records *strings.Builder, level slog.Level) *gangway.Handler {
+		return newHandlerWithConfig(t, gangway.Config{
+			DockerSocket:    socket,
+			UpstreamTimeout: time.Second,
+			Logger:          slog.New(slog.NewJSONHandler(records, &slog.HandlerOptions{Level: level})),
+		})
+	}
+
+	h := newHandlerFor(&atInfo, slog.LevelInfo)
+	for range requests {
+		rr := httptest.NewRecorder()
+		h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/_ping", nil))
+
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want the daemon's own 503", rr.Code)
+		}
+	}
+
+	if !strings.Contains(atInfo.String(), `"level":"WARN"`) ||
+		!strings.Contains(atInfo.String(), "docker daemon reported a server error") {
+		t.Errorf("a Docker server error was not reported at warn: %s", atInfo.String())
+	}
+	// One record for the burst. The proxy cannot keep a client from provoking
+	// the daemon, only from setting the pace of the log while it does.
+	if got := strings.Count(atInfo.String(), `"level":"WARN"`); got != 1 {
+		t.Errorf("%d warnings for %d requests within %s, want 1", got, requests, gangway.UpstreamWarnInterval)
+	}
+
+	// The same failures at debug, where the ones the limit dropped still are.
+	h = newHandlerFor(&atDebug, slog.LevelDebug)
+	for range requests {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/_ping", nil))
+	}
+
+	if got := strings.Count(atDebug.String(), "docker API returned an error status"); got != requests-1 {
+		t.Errorf("%d server errors at debug, want the %d the warning limit dropped", got, requests-1)
+	}
+
+	// A status the daemon chose about the object asked for is not a fault here.
+	status = http.StatusNotFound
+
+	var clientError strings.Builder
+	h = newHandlerFor(&clientError, slog.LevelInfo)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/_ping", nil))
+
+	if clientError.Len() != 0 {
+		t.Errorf("a 404 from Docker was logged above debug: %s", clientError.String())
+	}
+}
+
 // TestUpstreamFaultsAreLoggedImmediately covers the other half: a daemon that
 // cannot be reached, or answers with something unparseable, is a fault an
 // operator must see without turning on debug logging, and it is recorded as it
@@ -141,6 +208,51 @@ func TestUpstreamFaultsAreLoggedImmediately(t *testing.T) {
 			t.Errorf("invalid response not logged at error: %s", logged.String())
 		}
 	})
+}
+
+// TestTruncatedResponseIsAnUnreachableDaemon separates a daemon that stopped
+// answering from one that answered badly. Both reach the decoder as an error,
+// and to an operator they are opposite things: a body that ends part way
+// through is the daemon restarting or being killed, not a response shape this
+// proxy cannot parse, and reporting it as the latter sends the reader looking
+// for a Docker version mismatch that is not there.
+func TestTruncatedResponseIsAnUnreachableDaemon(t *testing.T) {
+	var logged strings.Builder
+	socket := startDocker(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// A length that promises more than what follows, flushed so the client
+		// really receives a response and starts reading a body it will never
+		// see the end of. Without the flush the connection would drop before
+		// any of it left the server, and the failure would be the round trip
+		// rather than the read this test is about.
+		w.Header().Set("Content-Length", "4096")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"Id":"sha256:`)
+		w.(http.Flusher).Flush()
+		panic(http.ErrAbortHandler)
+	}))
+	h := newHandlerWithConfig(t, gangway.Config{
+		DockerSocket:    socket,
+		UpstreamTimeout: time.Second,
+		Logger:          slog.New(slog.NewJSONHandler(&logged, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	})
+
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/v1.55/images/app/json", nil))
+
+	if rr.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rr.Code)
+	}
+	if !strings.Contains(logged.String(), "docker daemon is unreachable") {
+		t.Errorf("a truncated response was not reported as an unreachable daemon: %s", logged.String())
+	}
+	// The failure has to be the body read rather than the request, or this
+	// would pass without the response ever having started.
+	if !strings.Contains(logged.String(), "docker response could not be read") {
+		t.Errorf("the fault did not come from reading the body: %s", logged.String())
+	}
+	if strings.Contains(logged.String(), "invalid docker API response") {
+		t.Errorf("a truncated response was reported as an unparseable one: %s", logged.String())
+	}
 }
 
 // TestUpstreamTimeouts covers every stage a Docker response can stall at, and

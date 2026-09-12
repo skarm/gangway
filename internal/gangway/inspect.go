@@ -2,6 +2,7 @@ package gangway
 
 import (
 	"errors"
+	"maps"
 	"net/http"
 	"strings"
 )
@@ -49,6 +50,14 @@ func (h *Handler) handleContainerInspect(w http.ResponseWriter, r *http.Request,
 // what the proxy has always done; with one, a label added to a container
 // somewhere else cannot reach a client just because it exists.
 //
+// The map is edited in place. It was decoded for this request, nothing else has
+// a reference to it, and the alternative is holding the whole of it twice while
+// a copy is built: the memory this proxy is sized for is one decoded response
+// per slot, and a filter that doubles the largest allocation on the path would
+// be the one thing that makes the bound wrong. What a Go map does not give back
+// is the space the deleted entries left, which is bounded by the map that was
+// already paid for.
+//
 // A nil map stays nil, so "Docker reported no labels" is still distinguishable
 // from "every label was filtered out".
 func (h *Handler) filterLabels(labels map[string]string) map[string]string {
@@ -56,18 +65,20 @@ func (h *Handler) filterLabels(labels map[string]string) map[string]string {
 		return labels
 	}
 
-	kept := make(map[string]string)
+	maps.DeleteFunc(labels, func(key, _ string) bool { return !h.allowsLabel(key) })
 
-	for key, value := range labels {
-		for _, prefix := range h.labelPrefixes {
-			if strings.HasPrefix(key, prefix) {
-				kept[key] = value
-				break
-			}
+	return labels
+}
+
+// allowsLabel reports whether a label key matches the configured allowlist.
+func (h *Handler) allowsLabel(key string) bool {
+	for _, prefix := range h.labelPrefixes {
+		if strings.HasPrefix(key, prefix) {
+			return true
 		}
 	}
 
-	return kept
+	return false
 }
 
 // imageInspect is both the subset decoded from Docker and the response body,
@@ -108,7 +119,9 @@ func (h *Handler) fetchJSON(w http.ResponseWriter, r *http.Request, path string,
 		return false
 	}
 
-	if err := decodeJSON(resp.Body, h.maxResponseBytes, dst); err != nil {
+	// ContentLength is -1 when the daemon sent no length or framed the response
+	// in chunks, which decodeJSON reads as "no hint" rather than as a size.
+	if err := decodeJSON(resp.Body, h.maxResponseBytes, resp.ContentLength, dst); err != nil {
 		h.writeUpstreamInvalid(w, r, err)
 		return false
 	}

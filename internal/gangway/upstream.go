@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"time"
 )
 
 // maxUpstreamErrorBytes caps how much of a Docker error body the proxy drains
@@ -44,9 +45,12 @@ func (h *Handler) request(ctx context.Context, method, path string) (*http.Respo
 // status. Dropping it also means a message quoting an image reference, which the
 // client itself supplied, cannot be reflected back out of the proxy.
 //
-// A status Docker chose is not a fault here, and asking about a container that
-// no longer exists is ordinary traffic, so this is the one upstream outcome that
-// stays a debug record: the client decides how often it happens.
+// A 4xx is an answer about the object that was asked for: a container that has
+// already gone is ordinary traffic, the client decides how often it happens, and
+// it stays a debug record. A 5xx is the daemon reporting that it could not
+// serve the request at all, which means attestation is failing for a reason
+// nothing in this proxy will show otherwise, so it is a warning — rate limited,
+// because the client still decides how often it is provoked.
 func (h *Handler) writeUpstreamStatus(w http.ResponseWriter, r *http.Request, resp *http.Response) {
 	// A body that stalls or is cut short mid-drain means the daemon failed to
 	// answer, not that it answered with this status.
@@ -61,8 +65,14 @@ func (h *Handler) writeUpstreamStatus(w http.ResponseWriter, r *http.Request, re
 		status = http.StatusBadGateway
 	}
 
-	h.log.DebugContext(r.Context(), "docker API returned an error status",
-		"upstream_status", resp.StatusCode, "status", status)
+	if resp.StatusCode >= http.StatusInternalServerError && h.upstreamWarn.allow(time.Now()) {
+		h.log.WarnContext(r.Context(), "docker daemon reported a server error",
+			"upstream_status", resp.StatusCode, "status", status,
+			"warn_interval", upstreamWarnInterval.String())
+	} else {
+		h.log.DebugContext(r.Context(), "docker API returned an error status",
+			"upstream_status", resp.StatusCode, "status", status)
+	}
 
 	writeError(w, status, bodyUpstreamFail)
 }
@@ -101,8 +111,10 @@ func (h *Handler) writeUpstreamUnavailable(w http.ResponseWriter, r *http.Reques
 }
 
 // writeUpstreamInvalid reports a response the proxy could not make sense of. A
-// body truncated by a timeout also reads as invalid, so the timeout case is
-// separated out first.
+// body that never arrived in full reads as invalid to a decoder while being a
+// different fault entirely, so those cases are separated out first: a timeout, a
+// client that went away, and a body the daemon stopped sending part way through
+// are all the daemon failing to answer rather than answering badly.
 //
 // Whatever remains is a daemon that answered 200 with something this proxy
 // cannot parse: a Docker version whose response shape changed, a response past
@@ -110,7 +122,7 @@ func (h *Handler) writeUpstreamUnavailable(w http.ResponseWriter, r *http.Reques
 // of those are things a client did, and all of them mean attestation is broken
 // right now, so it is logged immediately at error level.
 func (h *Handler) writeUpstreamInvalid(w http.ResponseWriter, r *http.Request, err error) {
-	if isTimeout(err) || r.Context().Err() != nil {
+	if isTimeout(err) || r.Context().Err() != nil || errors.Is(err, ErrUpstreamRead) {
 		h.writeUpstreamUnavailable(w, r, err)
 		return
 	}

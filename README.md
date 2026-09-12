@@ -72,10 +72,14 @@ Flags (`--help` for the full list):
 bounds how many Docker is asked to serve over time, which the first does not:
 eight slots that each turn over in a millisecond are eight thousand inspects a
 second against the daemon. Excess requests receive HTTP 429 immediately rather
-than queueing. The bucket holds four seconds of requests, so an agent that
-restarts and re-attests every workload at once is absorbed rather than refused;
-raise the rate for a node that sustains more than twenty-five attestations a
-second, which is two inspects each.
+than queueing, and a request refused for want of a slot receives 503 without
+spending a token — neither limit is charged for work Docker never did, so a
+client retrying into a busy proxy cannot exhaust the budget the requests being
+served need. The bucket holds four seconds of requests, and never fewer than
+`--max-concurrent` of them, so an agent that restarts and re-attests every
+workload at once is absorbed rather than refused; raise the rate for a node that
+sustains more than twenty-five attestations a second, which is two inspects
+each.
 
 `--allow-uid` and `--allow-gid` check the peer's credentials (`SO_PEERCRED`) as
 the kernel reports them, which a client cannot forge and which holds even if the
@@ -96,15 +100,29 @@ because it exists.
 `--max-response-bytes` and `--max-concurrent` together decide how much memory
 the process needs. A response costs up to sixteen times its own size in live
 heap once decoded — the JSON is the small part, the map its labels decode into
-is not — so the worst case in flight is their product times 16, logged as
+is not — measured across everything a request holds at once: the bytes read from
+the daemon, the map they decoded to, the label filter applied to it, and the
+reply encoded beside them. `--label-prefix` adds nothing to that, because it
+edits the decoded map rather than building a second one. The worst case in
+flight is the product of the two limits times 16, logged as
 `worst_case_memory_bytes` at start-up: 128 MiB at the defaults. Give the process
 at least twice that, and expect a warning in the log when `GOMEMLIMIT` is set
 below it. `GOMEMLIMIT` on its own only makes the collector work harder; it
 cannot reclaim a response a request is still decoding.
 
-Out-of-range values exit with status 2 without touching either socket. On
-`SIGTERM`/`SIGINT` the service stops accepting connections and drains within the
-shutdown timeout; the service manager's stop timeout must exceed it.
+Exit status 2 is a configuration mistake and status 1 is a runtime failure, a
+distinction `RestartPreventExitStatus=2` rests on. An out-of-range value, a
+relative path, a `--listen-socket` that is not already clean, and one path
+written for both sockets are all refused before either socket is touched; so are
+the mistakes that can only be seen once the filesystem has been read, such as a
+listen path that resolves onto the Docker socket through a symlink, or a
+`--docker-socket` that is not a socket. A path that is spelled correctly and
+fails on what happens to be on disk — a socket directory that is a regular file,
+a listen socket another instance still holds — exits 1, because the next start
+may well find it fixed.
+
+On `SIGTERM`/`SIGINT` the service stops accepting connections and drains within
+the shutdown timeout; the service manager's stop timeout must exceed it.
 
 ## Deployment options
 
@@ -385,7 +403,8 @@ have. Read this section before deploying it.
 - Upstream timeouts, response-size limits, bounded concurrency and `--max-rate`
   keep a single request from growing without bounds and keep a client from
   turning a bounded number of slots into unbounded work against the daemon.
-  Saturation returns HTTP 503, an exceeded rate returns HTTP 429. Idle accepted
+  Saturation returns HTTP 503, an exceeded rate returns HTTP 429, and a request
+  answered with either costs the other limit nothing. Idle accepted
   connections are reaped after two seconds without a request header, or a
   30-second keep-alive idle timeout.
 - The response-size and concurrency limits are the memory bound described under
@@ -397,16 +416,18 @@ have. Read this section before deploying it.
   logs are JSON on stdout that never contain Docker response bodies.
 - **Faults are logged as they happen, at a level the default configuration
   shows**: a daemon the proxy cannot reach or that times out is a `WARN`, a
-  response it cannot parse is an `ERROR`. An operator should not have to enable
+  response it cannot parse is an `ERROR`, and a daemon answering `5xx` is a
+  `WARN` at most once every 30 seconds. An operator should not have to enable
   debug logging to learn that attestation has stopped working. The trade-off is
   that a daemon that stays down produces a record per attempt; `--max-rate` is
   what bounds how fast that can be.
 - What a *client* provokes stays a debug record — a denied request, a throttled
-  one, a rejected socket peer, and a status Docker chose, such as the 404 for a
+  one, a rejected socket peer, and a `4xx` Docker chose, such as the 404 for a
   container that has already exited. None of those are faults here, and keeping
   them at debug is what stops a client from turning its own traffic into log
   volume, or into contention on the logging handler. Run with
   `--log-level=debug` to see them, and expect a client that is being rejected to
-  set the pace of the log while it is on.
+  set the pace of the log while it is on. The `5xx` warnings the rate limit
+  drops are there too.
 - Start-up, shutdown, and faults in the proxy itself, including a recovered
   handler panic, are at the default level.

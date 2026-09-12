@@ -30,7 +30,9 @@ const (
 // part: what a container inspect decodes to is a map, and the shape that costs
 // the most per byte is Labels made of many short distinct keys, which alone is
 // nine to twelve times the body it came from. The read buffer holding that body
-// and the re-encoded response built beside it account for the rest.
+// and the re-encoded response built beside it account for the rest. The label
+// allowlist adds nothing: it deletes from the decoded map instead of building a
+// second one, which at this factor is the difference between fitting and not.
 //
 // Measured between 7 and 14 in total, across response limits from 512 bytes to
 // 16 MiB, peaking between 8 and 16 KiB and falling above that as a bigger map

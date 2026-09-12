@@ -11,14 +11,40 @@ import (
 // maxPathComponents budgets both symlink hops and path depth while resolving.
 const maxPathComponents = 255
 
+// validatePathSyntax rejects socket paths that cannot be right whatever the
+// filesystem holds. It is the part of ValidatePaths that needs no I/O, so the
+// command line can run it while the answer is still a usage error, before a
+// logger or a socket exists.
+func validatePathSyntax(listenPath, dockerPath string) error {
+	for _, path := range []string{listenPath, dockerPath} {
+		if !filepath.IsAbs(path) {
+			return configErrorf("socket path must be absolute: %q", path)
+		}
+	}
+
+	// Compared as written. Cleaning them first would rewrite "dir/link/.." into
+	// "dir" without knowing what the link points at, which is the mistake
+	// resolvePath exists to avoid: two paths that differ only in a ".." can name
+	// two different sockets. Every alias beyond an identical spelling needs the
+	// filesystem, and ValidatePaths is where it is caught.
+	if listenPath == dockerPath {
+		return configErrorf("listen socket and Docker socket must be different paths")
+	}
+
+	return nil
+}
+
 // ValidatePaths rejects configurations where the listen socket and the Docker
 // socket are, or could become, the same file. Serving on the Docker socket
 // would replace the daemon's own endpoint.
+//
+// A verdict that can never change — a relative path, two names for one socket,
+// a docker-socket path that is not a socket — is a ConfigError, and exits 2. A
+// path that could not be resolved or inspected is not: the filesystem may look
+// different on the next start, so it stays a runtime failure.
 func ValidatePaths(listenPath, dockerPath string) error {
-	for _, path := range []string{listenPath, dockerPath} {
-		if !filepath.IsAbs(path) {
-			return fmt.Errorf("socket path must be absolute: %q", path)
-		}
+	if err := validatePathSyntax(listenPath, dockerPath); err != nil {
+		return err
 	}
 
 	listenResolved, err := resolvePath(listenPath)
@@ -32,7 +58,7 @@ func ValidatePaths(listenPath, dockerPath string) error {
 	}
 
 	if listenResolved == dockerResolved {
-		return errors.New("listen socket and Docker socket must be different paths")
+		return configErrorf("listen socket and Docker socket must be different paths")
 	}
 
 	listenInfo, listenErr := os.Stat(listenPath)
@@ -43,12 +69,12 @@ func ValidatePaths(listenPath, dockerPath string) error {
 
 	if dockerErr == nil {
 		if dockerInfo.Mode()&os.ModeSocket == 0 {
-			return fmt.Errorf("docker socket is not a Unix socket: %q", dockerPath)
+			return configErrorf("docker socket is not a Unix socket: %q", dockerPath)
 		}
 		// Distinct names can still be one inode; a hard link would otherwise
 		// pass the comparison above.
 		if listenErr == nil && os.SameFile(listenInfo, dockerInfo) {
-			return errors.New("listen socket and Docker socket refer to the same file")
+			return configErrorf("listen socket and Docker socket refer to the same file")
 		}
 	}
 

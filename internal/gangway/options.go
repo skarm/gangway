@@ -128,6 +128,14 @@ func Parse(args []string, output io.Writer) (Options, error) {
 	if opts.Proxy.LabelPrefixes, err = splitList("label-prefix", labelPrefixes); err != nil {
 		return Options{}, err
 	}
+	// The part of the socket configuration that needs no filesystem: a relative
+	// path, or one path written for both sockets, is wrong wherever the proxy
+	// runs. Checking it here makes it a usage error, which is what a supervisor
+	// told to stop on exit 2 needs to see. The rest of ValidatePaths depends on
+	// what is on disk and runs at start-up.
+	if err := validatePathSyntax(opts.ListenSocket, opts.Proxy.DockerSocket); err != nil {
+		return Options{}, err
+	}
 	// Every proxy flag carries a non-zero default, so an out-of-range value is
 	// a usage error rather than a request for the default.
 	if err := opts.Proxy.Validate(); err != nil {

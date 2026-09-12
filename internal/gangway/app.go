@@ -39,6 +39,28 @@ const (
 	exitUsage   = 2
 )
 
+// ConfigError marks a failure as a mistake in the configuration rather than a
+// fault in the environment. It is what the two exit codes rest on: a supervisor
+// running with RestartPreventExitStatus=2 has to stop rather than restart a
+// proxy whose flags cannot work in any environment, and has to keep restarting
+// one whose Docker socket merely was not there yet.
+//
+// Only checks whose verdict cannot change on the next start belong here. A path
+// that cannot be resolved, a socket that cannot be created and an unreachable
+// daemon are all runtime failures, however they were spelled in the unit file.
+type ConfigError struct{ Err error }
+
+func (e *ConfigError) Error() string { return e.Err.Error() }
+
+func (e *ConfigError) Unwrap() error { return e.Err }
+
+// configErrorf builds a ConfigError from a format string, the way fmt.Errorf
+// builds an error. Wrapping one in turn keeps it a ConfigError, so a caller may
+// add its own context without deciding the exit code again.
+func configErrorf(format string, args ...any) error {
+	return &ConfigError{Err: fmt.Errorf(format, args...)}
+}
+
 // Main runs the command and returns the process exit code. Structured logs go
 // to stdout; usage errors go to stderr as plain text, before any logger exists.
 func Main(args []string, stdout, stderr io.Writer) int {
@@ -69,7 +91,17 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	defer stop()
 
 	if err := Run(ctx, opts, log); err != nil {
+		// Everything Parse can decide has already exited 2 by here, but the
+		// checks that need the filesystem — a listen socket that resolves onto
+		// the Docker socket, a docker-socket path that is not a socket at all —
+		// can only run in Run, and are configuration mistakes just the same.
+		if errors.As(err, new(*ConfigError)) {
+			log.Error("invalid configuration", "error", err)
+			return exitUsage
+		}
+
 		log.Error("proxy stopped with an error", "error", err)
+
 		return exitFailure
 	}
 
@@ -83,7 +115,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) error {
 	proxy := opts.Proxy.WithDefaults()
 
 	if err := proxy.Validate(); err != nil {
-		return fmt.Errorf("invalid proxy configuration: %w", err)
+		return configErrorf("invalid proxy configuration: %w", err)
 	}
 
 	if err := ValidatePaths(opts.ListenSocket, proxy.DockerSocket); err != nil {
@@ -94,7 +126,7 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) error {
 
 	handler, err := NewHandler(proxy)
 	if err != nil {
-		return fmt.Errorf("invalid proxy configuration: %w", err)
+		return configErrorf("invalid proxy configuration: %w", err)
 	}
 	defer handler.Close()
 
@@ -108,7 +140,10 @@ func Run(ctx context.Context, opts Options, log *slog.Logger) error {
 	// that a permitted one needs.
 	authorized, err := AuthorizePeers(socket, opts.Peers, log)
 	if err != nil {
-		return errors.Join(fmt.Errorf("authorize socket peers: %w", err), socket.Close())
+		// A policy this platform cannot enforce is a configuration that can
+		// never work here, not an outage: Parse refuses it already, and this is
+		// the same refusal for a Run called directly.
+		return errors.Join(configErrorf("authorize socket peers: %w", err), socket.Close())
 	}
 
 	maxConnections := connectionsPerRequest * proxy.MaxConcurrent
